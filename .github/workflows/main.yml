@@ -27,14 +27,11 @@ jobs:
         
         cd $(dirname "$PROJECT_DIR")
         
-        # ایجاد امضای دیجیتال
+        # ساخت فایل امضای دیجیتال
         keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "C=US, O=Android, CN=Android Debug"
         
-        # دادن دسترسی اجرایی به wrapper
-        chmod +x gradlew
-        
-        # اجرای بیلد با غیرفعال کردن اجرای موازی KSP (راه حل اصلی)
-        ./gradlew assembleDebug -Dksp.useKSP2=false --no-daemon --no-configuration-cache
+        # استفاده مستقیم از گریدلِ خود سرور (حذف gradlew) به همراه دور زدن باگ KSP
+        gradle assembleDebug -Dksp.useKSP2=false --no-daemon --no-configuration-cache
 
     - name: Upload APK
       uses: actions/upload-artifact@v4
