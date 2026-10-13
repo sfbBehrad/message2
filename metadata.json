@@ -1,0 +1,6 @@
+{
+  "name": "RadioBridge",
+  "description": "Secure offline long-range communication over ESP32 Bluetooth and NRF24L01 radio bridge with AES-256 encryption, 32-byte chunking, and TCP-like ACK protocol.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
