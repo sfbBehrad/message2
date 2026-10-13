@@ -17,7 +17,7 @@ jobs:
         java-version: '17'
         distribution: 'temurin'
 
-    - name: Build with global Gradle
+    - name: Fix KSP Bug and Build
       run: |
         # پیدا کردن مسیر اصلی پروژه
         PROJECT_DIR=$(find . -name "settings.gradle*" | head -n 1)
@@ -31,11 +31,15 @@ jobs:
         # ساخت فایل امضای دیجیتال
         keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "C=US, O=Android, CN=Android Debug"
         
-        # بیلد کردن پروژه
-        gradle assembleDebug
+        # ساختن راه‌انداز با نسخه پایدار 8.7 برای جلوگیری از کرش کردن KSP
+        gradle wrapper --gradle-version 8.7
+        chmod +x gradlew
+        
+        # بیلد کردن پروژه بدون استفاده از کش و دیمون (راه حل اصلی ارور KSP)
+        ./gradlew assembleDebug --no-daemon --no-configuration-cache
 
     - name: Upload APK
       uses: actions/upload-artifact@v4
       with:
-        name: secure-chat-v2-apk
+        name: secure-chat-final-apk
         path: "**/build/outputs/apk/debug/*.apk"
