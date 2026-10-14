@@ -77,10 +77,18 @@ class BluetoothService(private val context: Context) {
     var simulatedPacketDropRatePercent: Int = 0 // 0 to 100%
 
     init {
-        // Default to Hardware if Bluetooth is available and enabled, otherwise Simulator
-        if (bluetoothAdapter != null && bluetoothAdapter.isEnabled) {
-            _transportMode.value = TransportMode.HARDWARE_BLUETOOTH
-        } else {
+        try {
+            // Default to Hardware if Bluetooth is available and enabled, otherwise Simulator
+            if (bluetoothAdapter != null && bluetoothAdapter.isEnabled) {
+                _transportMode.value = TransportMode.HARDWARE_BLUETOOTH
+            } else {
+                _transportMode.value = TransportMode.VIRTUAL_SIMULATOR
+            }
+        } catch (e: SecurityException) {
+            e.printStackTrace()
+            _transportMode.value = TransportMode.VIRTUAL_SIMULATOR
+        } catch (e: Exception) {
+            e.printStackTrace()
             _transportMode.value = TransportMode.VIRTUAL_SIMULATOR
         }
     }
@@ -98,17 +106,23 @@ class BluetoothService(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     fun refreshPairedDevices() {
-        val list = mutableListOf<DiscoveredDevice>()
-        bluetoothAdapter?.bondedDevices?.forEach { device ->
-            list.add(
-                DiscoveredDevice(
-                    name = device.name ?: "Unknown",
-                    address = device.address,
-                    isPaired = true
+        try {
+            val list = mutableListOf<DiscoveredDevice>()
+            bluetoothAdapter?.bondedDevices?.forEach { device ->
+                list.add(
+                    DiscoveredDevice(
+                        name = device.name ?: "Unknown",
+                        address = device.address,
+                        isPaired = true
+                    )
                 )
-            )
+            }
+            _discoveredDevices.value = list
+        } catch (e: SecurityException) {
+            e.printStackTrace()
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
-        _discoveredDevices.value = list
     }
 
     @SuppressLint("MissingPermission")
@@ -140,6 +154,9 @@ class BluetoothService(private val context: Context) {
                 _connectedDeviceName.value = device.name ?: deviceAddress
 
                 startReadingPackets()
+            } catch (e: SecurityException) {
+                e.printStackTrace()
+                disconnect()
             } catch (e: Exception) {
                 e.printStackTrace()
                 disconnect()

@@ -15,13 +15,16 @@ import com.example.data.protocol.PacketParser
  *            6: Edit Message command
  *            7: TCP/UDP Text - Silent (No sound, no vibration)
  *            8: TCP/UDP Text - Critical Alarm (Continuous loud alarm on receiver)
+ *            9: Heartbeat Ping (E2E Link Monitoring)
+ *           10: Heartbeat Pong (E2E Link Confirmation)
+ *           11: NACK (Selective Repeat Missing Chunks)
  * Byte 1:    Message ID (0 - 255)
- * Bytes 2-3: Current Chunk Index (uint16, big-endian)
+ * Bytes 2-3: Current Chunk Index / Ping Seq / Missing Count (uint16, big-endian)
  * Bytes 4-5: Total Chunks (uint16, big-endian)
  * Bytes 6-31: Data Payload (up to 26 bytes)
  */
 data class RadioPacket(
-    val type: Int,          // 0 to 8
+    val type: Int,          // 0 to 11
     val messageId: Int,     // 0-255
     val chunkIndex: Int,    // 0-65535
     val totalChunks: Int,   // 1-65535
@@ -40,6 +43,9 @@ data class RadioPacket(
         const val TYPE_CMD_EDIT = 6        // Edit message
         const val TYPE_SILENT = 7          // Silent message
         const val TYPE_CRITICAL_ALARM = 8  // Emergency Alarm message
+        const val TYPE_HEARTBEAT_PING = 9  // E2E Ping
+        const val TYPE_HEARTBEAT_PONG = 10 // E2E Pong
+        const val TYPE_NACK = 11           // Selective Repeat NACK
 
         fun toBytes(packet: RadioPacket): ByteArray = PacketParser.serialize(packet)
 
@@ -50,6 +56,15 @@ data class RadioPacket(
 
         fun buildAckSeen(messageId: Int): RadioPacket =
             PacketParser.buildAckSeen(messageId)
+
+        fun buildHeartbeatPing(seq: Int): RadioPacket =
+            PacketParser.buildHeartbeatPing(seq)
+
+        fun buildHeartbeatPong(pingPacket: RadioPacket): RadioPacket =
+            PacketParser.buildHeartbeatPong(pingPacket)
+
+        fun buildNack(messageId: Int, missingIndices: List<Int>, totalChunks: Int): RadioPacket =
+            PacketParser.buildNack(messageId, missingIndices, totalChunks)
 
         fun typeName(type: Int): String = PacketParser.typeName(type)
     }

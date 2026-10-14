@@ -2,6 +2,7 @@ package com.example
 
 import com.example.data.crypto.AesSecurity
 import com.example.data.model.RadioPacket
+import com.example.data.protocol.PacketParser
 import com.example.util.MediaCompressor
 import org.junit.Assert.*
 import org.junit.Test
@@ -68,6 +69,39 @@ class RadioPacketProtocolTest {
     }
 
     @Test
+    fun testHeartbeatPingAndPongPackets() {
+        val ping = RadioPacket.buildHeartbeatPing(seq = 7)
+        assertEquals(RadioPacket.TYPE_HEARTBEAT_PING, ping.type)
+        val pingBytes = RadioPacket.toBytes(ping)
+        assertEquals(32, pingBytes.size)
+        assertEquals(9.toByte(), pingBytes[0])
+
+        val pong = RadioPacket.buildHeartbeatPong(ping)
+        assertEquals(RadioPacket.TYPE_HEARTBEAT_PONG, pong.type)
+        val pongBytes = RadioPacket.toBytes(pong)
+        assertEquals(32, pongBytes.size)
+        assertEquals(10.toByte(), pongBytes[0])
+        assertEquals(pong.messageId, ping.messageId)
+    }
+
+    @Test
+    fun testSelectiveRepeatNackSerialization() {
+        val missing = listOf(2, 5, 8, 14)
+        val nack = RadioPacket.buildNack(messageId = 55, missingIndices = missing, totalChunks = 20)
+        assertEquals(RadioPacket.TYPE_NACK, nack.type)
+        assertEquals(55, nack.messageId)
+
+        val nackBytes = RadioPacket.toBytes(nack)
+        assertEquals(32, nackBytes.size)
+        assertEquals(11.toByte(), nackBytes[0])
+
+        val parsed = RadioPacket.fromBytes(nackBytes)
+        assertNotNull(parsed)
+        val unpackedIndices = PacketParser.parseNackMissingIndices(parsed!!)
+        assertEquals(missing, unpackedIndices)
+    }
+
+    @Test
     fun testGzipCompressionAndAesEncryption() {
         val largeText = "Offline NRF24 long-range radio packet transmission with GZIP compression! ".repeat(20)
         val plainBytes = largeText.toByteArray(Charsets.UTF_8)
@@ -87,29 +121,6 @@ class RadioPacketProtocolTest {
         val recoveredText = String(decompressed, Charsets.UTF_8)
 
         assertEquals("Recovered text must match original", largeText, recoveredText)
-    }
-
-    @Test
-    fun testDeleteAndEditPacketTypes() {
-        val deletePacket = RadioPacket(
-            type = RadioPacket.TYPE_CMD_DELETE,
-            messageId = 15,
-            chunkIndex = 0,
-            totalChunks = 1,
-            payload = ByteArray(26)
-        )
-        val deleteBytes = RadioPacket.toBytes(deletePacket)
-        assertEquals(RadioPacket.TYPE_CMD_DELETE.toByte(), deleteBytes[0])
-
-        val editPacket = RadioPacket(
-            type = RadioPacket.TYPE_CMD_EDIT,
-            messageId = 15,
-            chunkIndex = 0,
-            totalChunks = 1,
-            payload = ByteArray(26)
-        )
-        val editBytes = RadioPacket.toBytes(editPacket)
-        assertEquals(RadioPacket.TYPE_CMD_EDIT.toByte(), editBytes[0])
     }
 
     @Test

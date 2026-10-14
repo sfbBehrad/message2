@@ -6,10 +6,9 @@ import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -26,8 +25,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.data.bluetooth.ConnectionStatus
-import com.example.data.bluetooth.DiscoveredDevice
 import com.example.data.bluetooth.TransportMode
+import com.example.service.BluetoothForegroundService
 import com.example.ui.theme.*
 import com.example.ui.viewmodel.RadioChatViewModel
 
@@ -41,15 +40,11 @@ fun SettingsScreen(
 
     val connectionStatus by viewModel.connectionStatus.collectAsState()
     val connectedDeviceName by viewModel.connectedDeviceName.collectAsState()
-    val discoveredDevices by viewModel.discoveredDevices.collectAsState()
     val transportMode by viewModel.transportMode.collectAsState()
-    val simulatedPacketLoss by viewModel.simulatedPacketLoss.collectAsState()
-    val passphrase by viewModel.passphrase.collectAsState()
-    val tcpRetryLimit by viewModel.tcpRetryLimit.collectAsState()
-    val isForegroundEnabled by viewModel.isForegroundServiceEnabled.collectAsState()
+    val appSettings by viewModel.appSettings.collectAsState()
 
     var showKeyDialog by remember { mutableStateOf(false) }
-    var keyInput by remember { mutableStateOf(passphrase) }
+    var keyInput by remember { mutableStateOf(appSettings.passphrase) }
     var showClearConfirm by remember { mutableStateOf(false) }
 
     val permissionsLauncher = rememberLauncherForActivityResult(
@@ -90,19 +85,19 @@ fun SettingsScreen(
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // Section: Protocol & TCP Retry Limit (Requirement 3)
+        // Section: TCP Retry Limit (Saved in Preferences DataStore)
         item {
             Card(
                 shape = RoundedCornerShape(12.dp),
                 colors = CardDefaults.cardColors(containerColor = TelegramSurface),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth().testTag("settings_retry_limit_card")
             ) {
                 Column(modifier = Modifier.padding(14.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.Repeat, contentDescription = null, tint = TelegramBlue, modifier = Modifier.size(20.dp))
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "TCP RETRANSMISSION & TIMEOUT",
+                            text = "TCP RETRANSMISSION LIMIT (DATASTORE)",
                             style = MaterialTheme.typography.labelSmall,
                             color = TelegramBlue,
                             fontWeight = FontWeight.Bold,
@@ -113,13 +108,17 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.height(10.dp))
 
                     Text(
-                        text = "Current TCP Retry Limit: ${if (tcpRetryLimit == Int.MAX_VALUE) "Infinite (∞)" else "$tcpRetryLimit retries"}",
+                        text = "Current Retry Limit: ${if (appSettings.tcpRetryLimit == Int.MAX_VALUE) "Infinite (∞)" else "${appSettings.tcpRetryLimit} retries"}",
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextBright,
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        text = "The 500ms loop will resend unacknowledged 32B chunks up to this limit before marking as Failed.",
+                        text = if (appSettings.tcpRetryLimit == Int.MAX_VALUE) {
+                            "Foreground Service will continuously broadcast un-ACKed packets in the background until the peer node connects and ACKs."
+                        } else {
+                            "The 500ms loop will resend unacknowledged 32B chunks up to ${appSettings.tcpRetryLimit} times before marking as Failed."
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = TextMuted,
                         fontSize = 11.sp
@@ -127,14 +126,13 @@ fun SettingsScreen(
 
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    // Preset buttons
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        listOf(10, 50, 100, 1000, Int.MAX_VALUE).forEach { limit ->
+                        listOf(10, 100, 1000, Int.MAX_VALUE).forEach { limit ->
                             val label = if (limit == Int.MAX_VALUE) "∞ Infinite" else "$limit"
-                            val isSelected = tcpRetryLimit == limit
+                            val isSelected = appSettings.tcpRetryLimit == limit
                             FilterChip(
                                 selected = isSelected,
                                 onClick = { viewModel.setTcpRetryLimit(limit) },
@@ -150,7 +148,193 @@ fun SettingsScreen(
             }
         }
 
-        // Section: Transmission Medium (Hardware vs Simulator)
+        // Section: Heartbeat & Resend Intervals (Saved in Preferences DataStore)
+        item {
+            Card(
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = TelegramSurface),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Timer, contentDescription = null, tint = TelegramGreen, modifier = Modifier.size(20.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "HEARTBEAT & RESEND INTERVALS (DATASTORE)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TelegramGreen,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    // Ping Interval
+                    Text(
+                        text = "Heartbeat Ping Interval: ${appSettings.pingIntervalSec}s",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextBright,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "Type 9 Ping packet sent periodically to monitor the 3 communication legs.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextMuted,
+                        fontSize = 11.sp
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(2, 5, 10, 30).forEach { sec ->
+                            FilterChip(
+                                selected = appSettings.pingIntervalSec == sec,
+                                onClick = { viewModel.setPingInterval(sec) },
+                                label = { Text("${sec}s", fontSize = 11.sp) }
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Infinite Resend Interval
+                    Text(
+                        text = "Infinite Retry Interval: ${appSettings.resendIntervalMs}ms",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextBright,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "Interval between background re-transmissions when in Infinite mode.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextMuted,
+                        fontSize = 11.sp
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(500L, 1000L, 2000L, 5000L).forEach { ms ->
+                            val label = if (ms >= 1000L) "${ms / 1000}s" else "${ms}ms"
+                            FilterChip(
+                                selected = appSettings.resendIntervalMs == ms,
+                                onClick = { viewModel.setResendInterval(ms) },
+                                label = { Text(label, fontSize = 11.sp) }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Section: AES-256 Pre-Shared Key (Saved in Preferences DataStore)
+        item {
+            Card(
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = TelegramSurface),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "AES-256 PRE-SHARED KEY (DATASTORE)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TelegramBlue,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Key: ${appSettings.passphrase.take(18)}...",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextBright,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp
+                        )
+                    }
+
+                    FilledTonalButton(
+                        onClick = {
+                            keyInput = appSettings.passphrase
+                            showKeyDialog = true
+                        }
+                    ) {
+                        Text("Edit", fontSize = 11.sp)
+                    }
+                }
+            }
+        }
+
+        // Section: Target ESP32 Node Selection
+        item {
+            Card(
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = TelegramSurface),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Text(
+                        text = "TARGET ESP32 BRIDGE NODE (DATASTORE)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TelegramBlue,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                viewModel.updateTargetNode("ESP_Node_1")
+                                viewModel.connectQuickNode("ESP_Node_1")
+                            },
+                            modifier = Modifier.weight(1f),
+                            border = ButtonDefaults.outlinedButtonBorder.copy(
+                                brush = androidx.compose.ui.graphics.SolidColor(
+                                    if (appSettings.targetNode == "ESP_Node_1") TelegramBlue else TextMuted
+                                )
+                            )
+                        ) {
+                            Text("ESP_Node_1", color = if (appSettings.targetNode == "ESP_Node_1") TelegramBlue else TextMuted, fontSize = 12.sp)
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                viewModel.updateTargetNode("ESP_Node_2")
+                                viewModel.connectQuickNode("ESP_Node_2")
+                            },
+                            modifier = Modifier.weight(1f),
+                            border = ButtonDefaults.outlinedButtonBorder.copy(
+                                brush = androidx.compose.ui.graphics.SolidColor(
+                                    if (appSettings.targetNode == "ESP_Node_2") TelegramAmber else TextMuted
+                                )
+                            )
+                        ) {
+                            Text("ESP_Node_2", color = if (appSettings.targetNode == "ESP_Node_2") TelegramAmber else TextMuted, fontSize = 12.sp)
+                        }
+                    }
+
+                    if (connectionStatus == ConnectionStatus.CONNECTED) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(
+                            onClick = { viewModel.disconnect() },
+                            colors = ButtonDefaults.buttonColors(containerColor = TelegramRed),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Disconnect ($connectedDeviceName)")
+                        }
+                    }
+                }
+            }
+        }
+
+        // Section: Transmission Medium
         item {
             Card(
                 shape = RoundedCornerShape(12.dp),
@@ -201,17 +385,16 @@ fun SettingsScreen(
                         }
                     }
 
-                    // Packet loss slider if in simulator mode
                     if (transportMode == TransportMode.VIRTUAL_SIMULATOR) {
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = "Simulated RF Loss: $simulatedPacketLoss% (Tests 500ms ACK Retries)",
+                            text = "Simulated RF Loss: ${appSettings.simulatedPacketLoss}% (Tests Selective Repeat NACK & Retries)",
                             style = MaterialTheme.typography.bodySmall,
                             color = TelegramAmber,
                             fontSize = 11.sp
                         )
                         Slider(
-                            value = simulatedPacketLoss.toFloat(),
+                            value = appSettings.simulatedPacketLoss.toFloat(),
                             onValueChange = { viewModel.setSimulatedPacketLoss(it.toInt()) },
                             valueRange = 0f..60f,
                             steps = 5,
@@ -225,7 +408,7 @@ fun SettingsScreen(
             }
         }
 
-        // Section: Foreground Service
+        // Section: Foreground Service Status
         item {
             Card(
                 shape = RoundedCornerShape(12.dp),
@@ -241,129 +424,25 @@ fun SettingsScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "KEEP BRIDGE RUNNING IN BACKGROUND",
+                            text = "BACKGROUND FOREGROUND SERVICE",
                             style = MaterialTheme.typography.labelSmall,
-                            color = TelegramBlue,
+                            color = TelegramGreen,
                             fontWeight = FontWeight.Bold,
                             fontFamily = FontFamily.Monospace
                         )
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = "Maintains persistent Bluetooth connection and listens for radio packets when minimized.",
+                            text = "Active with Partial WakeLock. Bluetooth streams, silent Heartbeat pings, and infinite retries continue when screen turns off.",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextMuted,
                             fontSize = 11.sp
                         )
                     }
-
-                    Switch(
-                        checked = isForegroundEnabled,
-                        onCheckedChange = { viewModel.toggleForegroundService(it) },
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = Color.White,
-                            checkedTrackColor = TelegramBlue
-                        )
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .background(TelegramGreen, CircleShape)
                     )
-                }
-            }
-        }
-
-        // Section: AES-256 Pre-Shared Key
-        item {
-            Card(
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(containerColor = TelegramSurface),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "AES-256 PRE-SHARED KEY",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TelegramBlue,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace
-                        )
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = "Key: ${passphrase.take(16)}...",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextBright,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 11.sp
-                        )
-                    }
-
-                    FilledTonalButton(
-                        onClick = {
-                            keyInput = passphrase
-                            showKeyDialog = true
-                        }
-                    ) {
-                        Text("Edit", fontSize = 11.sp)
-                    }
-                }
-            }
-        }
-
-        // Section: Target ESP32 Nodes
-        item {
-            Card(
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(containerColor = TelegramSurface),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Text(
-                        text = "QUICK CONNECT ESP32 NODES",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TelegramBlue,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        OutlinedButton(
-                            onClick = { viewModel.connectQuickNode("ESP_Node_1") },
-                            modifier = Modifier.weight(1f),
-                            border = ButtonDefaults.outlinedButtonBorder.copy(
-                                brush = androidx.compose.ui.graphics.SolidColor(TelegramBlue)
-                            )
-                        ) {
-                            Text("ESP_Node_1", color = TelegramBlue, fontSize = 12.sp)
-                        }
-
-                        OutlinedButton(
-                            onClick = { viewModel.connectQuickNode("ESP_Node_2") },
-                            modifier = Modifier.weight(1f),
-                            border = ButtonDefaults.outlinedButtonBorder.copy(
-                                brush = androidx.compose.ui.graphics.SolidColor(TelegramAmber)
-                            )
-                        ) {
-                            Text("ESP_Node_2", color = TelegramAmber, fontSize = 12.sp)
-                        }
-                    }
-
-                    if (connectionStatus == ConnectionStatus.CONNECTED) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Button(
-                            onClick = { viewModel.disconnect() },
-                            colors = ButtonDefaults.buttonColors(containerColor = TelegramRed),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Disconnect ($connectedDeviceName)")
-                        }
-                    }
                 }
             }
         }
@@ -435,7 +514,7 @@ fun SettingsScreen(
                         showKeyDialog = false
                     }
                 ) {
-                    Text("Save")
+                    Text("Save to DataStore")
                 }
             },
             dismissButton = {

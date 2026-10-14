@@ -12,6 +12,7 @@ data class ChatMessageEntity(
     val type: Int, // 0: UDP, 1: TCP, 2: File, etc.
     val textContent: String? = null,
     val fileBytes: ByteArray? = null,
+    val filePath: String? = null, // Path to saved image in cacheDir for Coil
     val fileName: String? = null,
     val isImage: Boolean = false,
     val timestamp: Long = System.currentTimeMillis(),
@@ -32,6 +33,7 @@ data class ChatMessageEntity(
                 sender == other.sender &&
                 type == other.type &&
                 textContent == other.textContent &&
+                filePath == other.filePath &&
                 fileName == other.fileName &&
                 isImage == other.isImage &&
                 timestamp == other.timestamp &&

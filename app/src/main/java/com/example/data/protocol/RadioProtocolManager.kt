@@ -5,12 +5,12 @@ import com.example.data.bluetooth.BluetoothService
 import com.example.data.crypto.AesSecurity
 import com.example.data.db.ChatRepository
 import com.example.data.model.*
+import com.example.service.BluetoothForegroundService
 import com.example.util.MediaCompressor
+import com.example.util.MediaTransferManager
 import com.example.util.NotificationHelper
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -24,10 +24,26 @@ class RadioProtocolManager(
     companion object {
         const val ACK_TIMEOUT_MS = 500L
         const val DEFAULT_RETRY_LIMIT = 10
+
+        fun prepareFramedStream(text: String): ByteArray {
+            val plainBytes = text.toByteArray(Charsets.UTF_8)
+            val gzipped = MediaCompressor.gzipCompress(plainBytes)
+            val encrypted = AesSecurity.encrypt(gzipped)
+            val totalEncryptedLen = encrypted.size
+            val stream = ByteArray(4 + totalEncryptedLen)
+            stream[0] = ((totalEncryptedLen shr 24) and 0xFF).toByte()
+            stream[1] = ((totalEncryptedLen shr 16) and 0xFF).toByte()
+            stream[2] = ((totalEncryptedLen shr 8) and 0xFF).toByte()
+            stream[3] = (totalEncryptedLen and 0xFF).toByte()
+            System.arraycopy(encrypted, 0, stream, 4, totalEncryptedLen)
+            return stream
+        }
     }
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val nextMessageId = AtomicInteger(1)
+
+    val mediaTransferManager = MediaTransferManager(context)
 
     // Configurable TCP retry limit: 10, 50, 100, 1000, or Int.MAX_VALUE
     var tcpRetryLimit: Int = DEFAULT_RETRY_LIMIT
@@ -47,39 +63,42 @@ class RadioProtocolManager(
     private var totalBytesTransferred = 0L
     private var totalBytesSavedGzip = 0L
 
-    // 60-minute rolling window: minuteOfDay -> Triple(sent, recv, failed)
-    private val minuteBuckets = ConcurrentHashMap<Int, IntArray>() // [0]=sent, [1]=recv, [2]=failed
+    private val minuteBuckets = ConcurrentHashMap<Int, IntArray>()
 
     // Pending ACK waiter: key = (messageId shl 16) or chunkIndex -> CompletableDeferred<Unit>
     private val pendingAcks = ConcurrentHashMap<Int, CompletableDeferred<Unit>>()
 
-    // In-progress reassembly for incoming messages: messageId -> Map<chunkIndex, payloadBytes>
+    // In-progress reassembly for incoming text messages: messageId -> Map<chunkIndex, payloadBytes>
     private val incomingChunks = ConcurrentHashMap<Int, ConcurrentHashMap<Int, ByteArray>>()
-    private val incomingMeta = ConcurrentHashMap<Int, Triple<Int, Int, String?>>() // messageId -> (type, totalChunks, optionalRefId)
+
+    // Active Selective Repeat outgoing packets: messageId -> Map<chunkIndex, RadioPacket>
+    private val activeOutgoingMediaPackets = ConcurrentHashMap<Int, Map<Int, RadioPacket>>()
 
     init {
-        // Collect incoming packets from Bluetooth
+        // Collect incoming packets from Foreground Service (or fallback bluetoothService)
+        scope.launch {
+            BluetoothForegroundService.incomingPackets.collect { packet ->
+                handleIncomingPacket(packet)
+            }
+        }
         scope.launch {
             bluetoothService.incomingPackets.collect { packet ->
-                handleIncomingPacket(packet)
+                if (BluetoothForegroundService.instance == null) {
+                    handleIncomingPacket(packet)
+                }
             }
         }
 
         // Collect outgoing packets for terminal logging & analytics
         scope.launch {
+            BluetoothForegroundService.outgoingPackets.collect { packet ->
+                logOutgoingPacket(packet)
+            }
+        }
+        scope.launch {
             bluetoothService.outgoingPackets.collect { packet ->
-                val isAck = packet.type == RadioPacket.TYPE_ACK_DELIVERED || packet.type == RadioPacket.TYPE_ACK_SEEN
-                addLog(
-                    direction = PacketLogEntry.Direction.TX,
-                    typeName = RadioPacket.typeName(packet.type),
-                    messageId = packet.messageId,
-                    chunkIndex = packet.chunkIndex,
-                    totalChunks = packet.totalChunks,
-                    hexDump = packet.toHexString(),
-                    isAck = isAck
-                )
-                if (!isAck) {
-                    recordMetric(sent = 1, recv = 0, failed = 0, retries = 0, bytes = RadioPacket.PACKET_SIZE.toLong())
+                if (BluetoothForegroundService.instance == null) {
+                    logOutgoingPacket(packet)
                 }
             }
         }
@@ -90,6 +109,25 @@ class RadioProtocolManager(
                 delay(2000)
                 refreshAnalyticsSnapshot()
             }
+        }
+    }
+
+    private fun logOutgoingPacket(packet: RadioPacket) {
+        val isAck = packet.type == RadioPacket.TYPE_ACK_DELIVERED ||
+                packet.type == RadioPacket.TYPE_ACK_SEEN ||
+                packet.type == RadioPacket.TYPE_HEARTBEAT_PONG ||
+                packet.type == RadioPacket.TYPE_NACK
+        addLog(
+            direction = PacketLogEntry.Direction.TX,
+            typeName = RadioPacket.typeName(packet.type),
+            messageId = packet.messageId,
+            chunkIndex = packet.chunkIndex,
+            totalChunks = packet.totalChunks,
+            hexDump = packet.toHexString(),
+            isAck = isAck
+        )
+        if (!isAck && packet.type != RadioPacket.TYPE_HEARTBEAT_PING) {
+            recordMetric(sent = 1, recv = 0, failed = 0, retries = 0, bytes = RadioPacket.PACKET_SIZE.toLong())
         }
     }
 
@@ -119,7 +157,6 @@ class RadioProtocolManager(
     private fun refreshAnalyticsSnapshot() {
         val currentKey = currentMinuteBucketKey()
         val points = mutableListOf<AnalyticsPoint>()
-        // Build 15-point window representing last hour
         for (i in 14 downTo 0) {
             val key = (currentKey - i * 4 + 60) % 60
             val bucket = minuteBuckets[key]
@@ -174,11 +211,24 @@ class RadioProtocolManager(
         _logs.value = emptyList()
     }
 
+    suspend fun transmitPacket(packet: RadioPacket): Boolean {
+        val service = BluetoothForegroundService.instance
+        return if (service != null) {
+            service.sendPacket(packet)
+        } else {
+            bluetoothService.sendPacket(packet)
+        }
+    }
+
     /**
      * Protocol-agnostic incoming packet handler.
      */
     private suspend fun handleIncomingPacket(packet: RadioPacket) {
-        val isAck = packet.type == RadioPacket.TYPE_ACK_DELIVERED || packet.type == RadioPacket.TYPE_ACK_SEEN
+        val isAck = packet.type == RadioPacket.TYPE_ACK_DELIVERED ||
+                packet.type == RadioPacket.TYPE_ACK_SEEN ||
+                packet.type == RadioPacket.TYPE_HEARTBEAT_PONG ||
+                packet.type == RadioPacket.TYPE_NACK
+
         addLog(
             direction = PacketLogEntry.Direction.RX,
             typeName = RadioPacket.typeName(packet.type),
@@ -189,7 +239,7 @@ class RadioProtocolManager(
             isAck = isAck
         )
 
-        if (!isAck) {
+        if (!isAck && packet.type != RadioPacket.TYPE_HEARTBEAT_PING) {
             recordMetric(sent = 0, recv = 1, failed = 0, retries = 0, bytes = RadioPacket.PACKET_SIZE.toLong())
         }
 
@@ -199,8 +249,11 @@ class RadioProtocolManager(
                 val key = ackKey(packet.messageId, packet.chunkIndex)
                 pendingAcks[key]?.complete(Unit)
 
-                if (packet.chunkIndex == packet.totalChunks - 1) {
+                // Complete whole file transfer if it's the final chunk or whole-file ACK
+                if (packet.chunkIndex == packet.totalChunks - 1 || packet.chunkIndex == 0) {
                     repository.updateStatusByByteId(packet.messageId, MessageStatus.DELIVERED)
+                    activeOutgoingMediaPackets.remove(packet.messageId)
+                    mediaTransferManager.updateProgress(packet.messageId, packet.totalChunks, packet.totalChunks, isSender = true, isComplete = true)
                     NotificationHelper.showMessageDeliveredNotification(context, "Radio Message #${packet.messageId}")
                 }
             }
@@ -210,18 +263,74 @@ class RadioProtocolManager(
                 repository.updateStatusByByteId(packet.messageId, MessageStatus.SEEN)
             }
 
+            // Type 11: NACK (Selective Repeat: Resend only missing chunks requested by receiver)
+            RadioPacket.TYPE_NACK -> {
+                val missingIndices = PacketParser.parseNackMissingIndices(packet)
+                val storedMap = activeOutgoingMediaPackets[packet.messageId]
+                if (storedMap != null) {
+                    scope.launch {
+                        for (idx in missingIndices) {
+                            val resendPacket = storedMap[idx]
+                            if (resendPacket != null) {
+                                transmitPacket(resendPacket)
+                                delay(MediaTransferManager.PACKET_BLAST_DELAY_MS)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Type 2: File/Image Chunk (Selective Repeat ARQ Reassembly)
+            RadioPacket.TYPE_FILE_CHUNK -> {
+                mediaTransferManager.handleIncomingChunk(
+                    packet = packet,
+                    onSendNack = { nackPacket ->
+                        scope.launch { transmitPacket(nackPacket) }
+                    },
+                    onComplete = { filePath, rawBytes ->
+                        scope.launch {
+                            // Immediately send Type 3 ACK to sender!
+                            val ack = RadioPacket(
+                                type = RadioPacket.TYPE_ACK_DELIVERED,
+                                messageId = packet.messageId,
+                                chunkIndex = packet.totalChunks - 1,
+                                totalChunks = packet.totalChunks,
+                                payload = ByteArray(RadioPacket.MAX_PAYLOAD_SIZE)
+                            )
+                            transmitPacket(ack)
+
+                            val chatMsg = ChatMessage(
+                                id = UUID.randomUUID().toString(),
+                                messageIdByte = packet.messageId,
+                                sender = SenderType.PEER,
+                                type = RadioPacket.TYPE_FILE_CHUNK,
+                                textContent = "Image (${rawBytes.size} bytes)",
+                                fileBytes = rawBytes,
+                                filePath = filePath,
+                                fileName = "radio_img_${packet.messageId}.jpg",
+                                isImage = true,
+                                totalChunks = packet.totalChunks,
+                                currentChunk = packet.totalChunks,
+                                status = MessageStatus.DELIVERED
+                            )
+                            repository.insertMessage(chatMsg)
+                            com.example.util.NotificationHandler.handleIncomingNotification(
+                                context,
+                                "ESP32 Node 2",
+                                "Sent an image (${rawBytes.size} bytes)",
+                                RadioPacket.TYPE_FILE_CHUNK
+                            )
+                        }
+                    }
+                )
+            }
+
             // Type 5: Remote Delete Message Command
             RadioPacket.TYPE_CMD_DELETE -> {
                 val targetMsgId = packet.messageId
                 val existing = repository.getLatestOutgoingByByteId(targetMsgId)
                 if (existing != null) {
                     repository.markAsDeleted(existing.id)
-                } else {
-                    // Also check incoming with that byteId
-                    val peerMsg = repository.allMessages // check by messageIdByte
-                    scope.launch {
-                        // find matching message
-                    }
                 }
             }
 
@@ -230,16 +339,15 @@ class RadioProtocolManager(
                 handleChunkAssembly(packet, isEdit = true)
             }
 
-            // Type 0, 1, 2, 7, 8: Regular text/file/priority data
+            // Type 0, 1, 7, 8: Text Messages
             RadioPacket.TYPE_UDP_TEXT,
             RadioPacket.TYPE_TCP_TEXT,
-            RadioPacket.TYPE_FILE_CHUNK,
             RadioPacket.TYPE_SILENT,
             RadioPacket.TYPE_CRITICAL_ALARM -> {
-                // If TCP text, File, Silent, or Alarm, IMMEDIATELY send Type 3 (Delivered ACK) back!
+                // If TCP or priority text, send Type 3 (Delivered ACK) back!
                 if (packet.type != RadioPacket.TYPE_UDP_TEXT) {
                     val ackPacket = RadioPacket.buildAckDelivered(packet)
-                    bluetoothService.sendPacket(ackPacket)
+                    transmitPacket(ackPacket)
                 }
                 handleChunkAssembly(packet, isEdit = false)
             }
@@ -250,17 +358,14 @@ class RadioProtocolManager(
         val msgId = packet.messageId
         val chunksMap = incomingChunks.getOrPut(msgId) { ConcurrentHashMap() }
         chunksMap[packet.chunkIndex] = packet.payload
-        incomingMeta[msgId] = Triple(packet.type, packet.totalChunks, null)
 
-        // Check if all chunks received
         if (chunksMap.size == packet.totalChunks) {
-            reassembleAndProcessMessage(msgId, packet.type, packet.totalChunks, chunksMap, isEdit)
+            reassembleAndProcessTextMessage(msgId, packet.type, packet.totalChunks, chunksMap, isEdit)
             incomingChunks.remove(msgId)
-            incomingMeta.remove(msgId)
         }
     }
 
-    private suspend fun reassembleAndProcessMessage(
+    private suspend fun reassembleAndProcessTextMessage(
         messageId: Int,
         type: Int,
         totalChunks: Int,
@@ -286,10 +391,7 @@ class RadioProtocolManager(
             if (totalLen <= 0 || totalLen > combined.size - 4) return
             val encryptedBytes = combined.sliceArray(4 until (4 + totalLen))
 
-            // AES-256 Decrypt
             val decryptedRaw = AesSecurity.decrypt(encryptedBytes) ?: return
-
-            // GZIP Decompress
             val decompressedBytes = MediaCompressor.gzipDecompress(decryptedRaw)
 
             if (isEdit) {
@@ -301,48 +403,37 @@ class RadioProtocolManager(
                 return
             }
 
-            // Create received chat message
-            val isFile = type == RadioPacket.TYPE_FILE_CHUNK
-            val isImg = if (isFile) isImageBytes(decompressedBytes) else false
-            val text = if (!isFile) String(decompressedBytes, Charsets.UTF_8) else null
-
+            val text = String(decompressedBytes, Charsets.UTF_8)
             val chatMsg = ChatMessage(
                 id = UUID.randomUUID().toString(),
                 messageIdByte = messageId,
                 sender = SenderType.PEER,
                 type = type,
-                textContent = if (isFile) (if (isImg) "Image (${decompressedBytes.size} bytes)" else "File (${decompressedBytes.size} bytes)") else text,
-                fileBytes = if (isFile) decompressedBytes else null,
-                fileName = if (isFile) (if (isImg) "radio_img_$messageId.jpg" else "radio_file_$messageId.bin") else null,
-                isImage = isImg,
+                textContent = text,
                 totalChunks = totalChunks,
                 currentChunk = totalChunks,
                 status = MessageStatus.DELIVERED
             )
 
             repository.insertMessage(chatMsg)
-
-            // Trigger notification according to header priority (Silent vs Normal vs Emergency Alarm)
-            val preview = chatMsg.textContent ?: (if (isImg) "Sent an image" else "Sent a file")
-            com.example.util.NotificationHandler.handleIncomingNotification(context, "ESP32 Node 2", preview, type)
+            com.example.util.NotificationHandler.handleIncomingNotification(
+                context,
+                "ESP32 Node 2",
+                text,
+                type
+            )
         } catch (e: Exception) {
             e.printStackTrace()
         }
     }
 
-    /**
-     * Automatically called when the user opens or views the chat screen.
-     * Sends Type 4 (ACK Seen) back to peer for all unseen messages!
-     */
     fun markChatAsSeen() {
         scope.launch {
-            // Also stop any running emergency alarm
             com.example.util.NotificationHandler.stopAlarm()
-
             val unseen = repository.getUnseenIncomingMessages()
             for (msg in unseen) {
                 val seenPacket = RadioPacket.buildAckSeen(msg.messageIdByte)
-                bluetoothService.sendPacket(seenPacket)
+                transmitPacket(seenPacket)
             }
             repository.markAllIncomingAsSeen()
         }
@@ -350,7 +441,6 @@ class RadioProtocolManager(
 
     /**
      * Sends a text message with GZIP compression, AES-256, chunking, and TCP ACK loop.
-     * headerType: 1 for standard TCP, 0 for UDP, 7 for Silent, 8 for Critical Loud Alarm.
      */
     fun sendTextMessage(
         text: String,
@@ -358,120 +448,8 @@ class RadioProtocolManager(
         replyToId: String? = null,
         replyToText: String? = null
     ) {
-        val plainBytes = text.toByteArray(Charsets.UTF_8)
-        sendMessageInternal(
-            rawBytes = plainBytes,
-            type = headerType,
-            textContent = text,
-            isImage = false,
-            fileName = null,
-            replyToId = replyToId,
-            replyToText = replyToText
-        )
-    }
-
-    /**
-     * Sends a file/image with Bitmap downscaling + GZIP compression + AES-256 + TCP ACK loop.
-     */
-    fun sendFile(fileBytes: ByteArray, fileName: String, isImage: Boolean) {
-        val preparedBytes = if (isImage) {
-            MediaCompressor.compressBitmap(fileBytes, maxDim = 800, quality = 50)
-        } else {
-            fileBytes
-        }
-
-        sendMessageInternal(
-            rawBytes = preparedBytes,
-            type = RadioPacket.TYPE_FILE_CHUNK,
-            textContent = if (isImage) "Image: $fileName (${preparedBytes.size}B)" else "File: $fileName (${preparedBytes.size}B)",
-            isImage = isImage,
-            fileName = fileName,
-            replyToId = null,
-            replyToText = null
-        )
-    }
-
-    /**
-     * Sends Type 5 command to delete a message locally and on the peer node.
-     */
-    fun sendDeleteMessage(message: ChatMessage) {
         scope.launch {
-            repository.markAsDeleted(message.id)
-            val packet = RadioPacket(
-                type = RadioPacket.TYPE_CMD_DELETE,
-                messageId = message.messageIdByte,
-                chunkIndex = 0,
-                totalChunks = 1,
-                payload = message.id.take(26).toByteArray(Charsets.UTF_8)
-            )
-            bluetoothService.sendPacket(packet)
-        }
-    }
-
-    /**
-     * Sends Type 6 command to edit an existing message.
-     */
-    fun sendEditMessage(message: ChatMessage, newText: String) {
-        scope.launch {
-            repository.updateTextContent(message.id, newText)
-
-            val plainBytes = newText.toByteArray(Charsets.UTF_8)
-            val gzipped = MediaCompressor.gzipCompress(plainBytes)
-            val encrypted = AesSecurity.encrypt(gzipped)
-
-            val stream = ByteArray(4 + encrypted.size)
-            stream[0] = ((encrypted.size shr 24) and 0xFF).toByte()
-            stream[1] = ((encrypted.size shr 16) and 0xFF).toByte()
-            stream[2] = ((encrypted.size shr 8) and 0xFF).toByte()
-            stream[3] = (encrypted.size and 0xFF).toByte()
-            System.arraycopy(encrypted, 0, stream, 4, encrypted.size)
-
-            val totalChunks = (stream.size + RadioPacket.MAX_PAYLOAD_SIZE - 1) / RadioPacket.MAX_PAYLOAD_SIZE
-
-            for (i in 0 until totalChunks) {
-                val start = i * RadioPacket.MAX_PAYLOAD_SIZE
-                val end = minOf(start + RadioPacket.MAX_PAYLOAD_SIZE, stream.size)
-                val chunkData = stream.sliceArray(start until end)
-
-                val packet = RadioPacket(
-                    type = RadioPacket.TYPE_CMD_EDIT,
-                    messageId = message.messageIdByte,
-                    chunkIndex = i,
-                    totalChunks = totalChunks,
-                    payload = chunkData
-                )
-                bluetoothService.sendPacket(packet)
-            }
-        }
-    }
-
-    private fun sendMessageInternal(
-        rawBytes: ByteArray,
-        type: Int,
-        textContent: String?,
-        isImage: Boolean,
-        fileName: String?,
-        replyToId: String?,
-        replyToText: String?
-    ) {
-        scope.launch {
-            // 1. GZIP Compress before encryption
-            val gzipped = MediaCompressor.gzipCompress(rawBytes)
-            val gzipSaved = maxOf(0L, (rawBytes.size - gzipped.size).toLong())
-
-            // 2. AES-256 Encrypt
-            val encrypted = AesSecurity.encrypt(gzipped)
-
-            // 3. Framing: [4-byte length] + [encrypted bytes]
-            val totalEncryptedLen = encrypted.size
-            val stream = ByteArray(4 + totalEncryptedLen)
-            stream[0] = ((totalEncryptedLen shr 24) and 0xFF).toByte()
-            stream[1] = ((totalEncryptedLen shr 16) and 0xFF).toByte()
-            stream[2] = ((totalEncryptedLen shr 8) and 0xFF).toByte()
-            stream[3] = (totalEncryptedLen and 0xFF).toByte()
-            System.arraycopy(encrypted, 0, stream, 4, totalEncryptedLen)
-
-            // 4. Calculate chunks
+            val stream = prepareFramedStream(text)
             val totalChunks = (stream.size + RadioPacket.MAX_PAYLOAD_SIZE - 1) / RadioPacket.MAX_PAYLOAD_SIZE
             val msgIdByte = nextMessageId.getAndIncrement() and 0xFF
             val uuid = UUID.randomUUID().toString()
@@ -480,11 +458,8 @@ class RadioProtocolManager(
                 id = uuid,
                 messageIdByte = msgIdByte,
                 sender = SenderType.ME,
-                type = type,
-                textContent = textContent,
-                fileBytes = rawBytes,
-                fileName = fileName,
-                isImage = isImage,
+                type = headerType,
+                textContent = text,
                 totalChunks = totalChunks,
                 currentChunk = 0,
                 retriesCurrentChunk = 0,
@@ -493,9 +468,7 @@ class RadioProtocolManager(
                 replyToText = replyToText
             )
 
-            // Persist to Room
             repository.insertMessage(chatMsg)
-            recordMetric(sent = 0, recv = 0, failed = 0, retries = 0, gzipSaved = gzipSaved)
 
             var allSucceeded = true
 
@@ -505,16 +478,16 @@ class RadioProtocolManager(
                 val chunkPayload = stream.sliceArray(start until end)
 
                 val packet = RadioPacket(
-                    type = type,
+                    type = headerType,
                     messageId = msgIdByte,
                     chunkIndex = chunkIdx,
                     totalChunks = totalChunks,
                     payload = chunkPayload
                 )
 
-                if (type == RadioPacket.TYPE_UDP_TEXT) {
-                    bluetoothService.sendPacket(packet)
-                    delay(30)
+                if (headerType == RadioPacket.TYPE_UDP_TEXT) {
+                    transmitPacket(packet)
+                    delay(25)
                     repository.updateProgress(uuid, chunkIdx + 1, 0, MessageStatus.SENT_UNACKED)
                 } else {
                     val key = ackKey(msgIdByte, chunkIdx)
@@ -525,7 +498,12 @@ class RadioProtocolManager(
                         val deferred = CompletableDeferred<Unit>()
                         pendingAcks[key] = deferred
 
-                        bluetoothService.sendPacket(packet)
+                        transmitPacket(packet)
+
+                        // Marked as SENT_UNACKED (1 tick: sent to local ESP32)
+                        if (chunkIdx == 0 && retries == 0) {
+                            repository.updateStatus(uuid, MessageStatus.SENT_UNACKED)
+                        }
 
                         try {
                             withTimeout(ACK_TIMEOUT_MS) {
@@ -544,7 +522,6 @@ class RadioProtocolManager(
                     if (!chunkAcked) {
                         allSucceeded = false
                         recordMetric(sent = 0, recv = 0, failed = 1, retries = 0)
-                        NotificationHelper.showMessageFailedNotification(context, textContent ?: "File transfer")
                         break
                     } else {
                         repository.updateProgress(uuid, chunkIdx + 1, 0, MessageStatus.SENDING)
@@ -554,22 +531,105 @@ class RadioProtocolManager(
 
             val finalStatus = when {
                 !allSucceeded -> MessageStatus.FAILED
-                type == RadioPacket.TYPE_UDP_TEXT -> MessageStatus.SENT_UNACKED
+                headerType == RadioPacket.TYPE_UDP_TEXT -> MessageStatus.SENT_UNACKED
                 else -> MessageStatus.DELIVERED
             }
             repository.updateStatus(uuid, finalStatus)
         }
     }
 
-    private fun ackKey(messageId: Int, chunkIndex: Int): Int {
-        return (messageId shl 16) or (chunkIndex and 0xFFFF)
+    /**
+     * Sends an image using Selective Repeat ARQ:
+     * Blasts ALL chunks sequentially, saves JPG in cacheDir for Coil, and awaits NACK/ACK.
+     */
+    fun sendImageSelectiveRepeat(
+        compressedBytes: ByteArray,
+        quality: Int
+    ) {
+        scope.launch {
+            val msgIdByte = nextMessageId.getAndIncrement() and 0xFF
+            val uuid = UUID.randomUUID().toString()
+
+            // Save JPG to local cacheDir for instant Coil display in UI
+            val cachedPath = MediaTransferManager.saveImageToCache(context, compressedBytes, msgIdByte)
+
+            val (packets, gzipSaved) = mediaTransferManager.prepareSelectiveRepeatPackets(
+                rawBytes = compressedBytes,
+                messageId = msgIdByte,
+                headerType = RadioPacket.TYPE_FILE_CHUNK
+            )
+
+            val totalChunks = packets.size
+            val packetMap = packets.associateBy { it.chunkIndex }
+            activeOutgoingMediaPackets[msgIdByte] = packetMap
+
+            val chatMsg = ChatMessage(
+                id = uuid,
+                messageIdByte = msgIdByte,
+                sender = SenderType.ME,
+                type = RadioPacket.TYPE_FILE_CHUNK,
+                textContent = "Image (${compressedBytes.size} bytes • Q$quality)",
+                fileBytes = compressedBytes,
+                filePath = cachedPath,
+                fileName = "radio_img_$msgIdByte.jpg",
+                isImage = true,
+                totalChunks = totalChunks,
+                currentChunk = 0,
+                status = MessageStatus.SENDING
+            )
+            repository.insertMessage(chatMsg)
+            recordMetric(sent = 0, recv = 0, failed = 0, retries = 0, gzipSaved = gzipSaved)
+
+            // Blast all chunks sequentially without waiting for individual ACKs
+            for ((idx, packet) in packets.withIndex()) {
+                transmitPacket(packet)
+                mediaTransferManager.updateProgress(msgIdByte, totalChunks, idx + 1, isSender = true)
+                delay(MediaTransferManager.PACKET_BLAST_DELAY_MS)
+            }
+
+            // Once blasted to local ESP32, mark as SENT_UNACKED (1 tick)
+            repository.updateStatus(uuid, MessageStatus.SENT_UNACKED)
+        }
     }
 
-    private fun isImageBytes(bytes: ByteArray): Boolean {
-        if (bytes.size < 4) return false
-        if (bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() && bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte()) return true
-        if (bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() && bytes[2] == 0xFF.toByte()) return true
-        if (bytes[0] == 0x47.toByte() && bytes[1] == 0x49.toByte() && bytes[2] == 0x46.toByte()) return true
-        return false
+    fun sendDeleteMessage(message: ChatMessage) {
+        scope.launch {
+            repository.markAsDeleted(message.id)
+            val packet = RadioPacket(
+                type = RadioPacket.TYPE_CMD_DELETE,
+                messageId = message.messageIdByte,
+                chunkIndex = 0,
+                totalChunks = 1,
+                payload = message.id.take(26).toByteArray(Charsets.UTF_8)
+            )
+            transmitPacket(packet)
+        }
+    }
+
+    fun sendEditMessage(message: ChatMessage, newText: String) {
+        scope.launch {
+            repository.updateTextContent(message.id, newText)
+            val stream = prepareFramedStream(newText)
+            val totalChunks = (stream.size + RadioPacket.MAX_PAYLOAD_SIZE - 1) / RadioPacket.MAX_PAYLOAD_SIZE
+
+            for (i in 0 until totalChunks) {
+                val start = i * RadioPacket.MAX_PAYLOAD_SIZE
+                val end = minOf(start + RadioPacket.MAX_PAYLOAD_SIZE, stream.size)
+                val chunkData = stream.sliceArray(start until end)
+
+                val packet = RadioPacket(
+                    type = RadioPacket.TYPE_CMD_EDIT,
+                    messageId = message.messageIdByte,
+                    chunkIndex = i,
+                    totalChunks = totalChunks,
+                    payload = chunkData
+                )
+                transmitPacket(packet)
+            }
+        }
+    }
+
+    private fun ackKey(messageId: Int, chunkIndex: Int): Int {
+        return (messageId shl 16) or (chunkIndex and 0xFFFF)
     }
 }

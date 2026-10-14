@@ -15,9 +15,12 @@ import com.example.data.model.RadioPacket
  *   6: Edit Message command
  *   7: TCP/UDP Text - Silent (No sound, no vibration)
  *   8: TCP/UDP Text - Critical Alarm (Continuous loud alarm on receiver)
+ *   9: Heartbeat Ping (E2E Link Monitoring)
+ *  10: Heartbeat Pong (E2E Link Confirmation)
+ *  11: NACK (Selective Repeat Missing Chunks Request)
  *
  * Byte 1: Message ID (0 - 255)
- * Bytes 2-3: Current Chunk Index (uint16 big-endian)
+ * Bytes 2-3: Current Chunk Index / Ping Seq / Missing Count (uint16 big-endian)
  * Bytes 4-5: Total Chunks (uint16 big-endian)
  * Bytes 6-31: Data Payload (up to 26 bytes)
  */
@@ -35,6 +38,9 @@ object PacketParser {
     const val TYPE_CMD_EDIT = 6
     const val TYPE_SILENT = 7
     const val TYPE_CRITICAL_ALARM = 8
+    const val TYPE_HEARTBEAT_PING = 9
+    const val TYPE_HEARTBEAT_PONG = 10
+    const val TYPE_NACK = 11
 
     /**
      * Parses a raw 32-byte array into a RadioPacket.
@@ -103,6 +109,74 @@ object PacketParser {
     }
 
     /**
+     * Builds a Type 9 (Heartbeat Ping) packet.
+     * Contains timestamp in payload for RTT calculation.
+     */
+    fun buildHeartbeatPing(seq: Int): RadioPacket {
+        val payload = ByteArray(MAX_PAYLOAD_SIZE)
+        val now = System.currentTimeMillis()
+        // Store 8-byte timestamp in payload
+        for (i in 0..7) {
+            payload[i] = ((now shr (56 - i * 8)) and 0xFF).toByte()
+        }
+        return RadioPacket(
+            type = TYPE_HEARTBEAT_PING,
+            messageId = seq and 0xFF,
+            chunkIndex = seq and 0xFFFF,
+            totalChunks = 1,
+            payload = payload
+        )
+    }
+
+    /**
+     * Builds a Type 10 (Heartbeat Pong) packet echoing the ping's sequence and timestamp.
+     */
+    fun buildHeartbeatPong(pingPacket: RadioPacket): RadioPacket {
+        return RadioPacket(
+            type = TYPE_HEARTBEAT_PONG,
+            messageId = pingPacket.messageId,
+            chunkIndex = pingPacket.chunkIndex,
+            totalChunks = 1,
+            payload = pingPacket.payload.copyOf()
+        )
+    }
+
+    /**
+     * Builds a Type 11 (NACK) packet requesting specific missing chunk indices.
+     */
+    fun buildNack(messageId: Int, missingIndices: List<Int>, totalChunks: Int): RadioPacket {
+        val payload = ByteArray(MAX_PAYLOAD_SIZE)
+        val count = minOf(missingIndices.size, MAX_PAYLOAD_SIZE / 2)
+        for (i in 0 until count) {
+            val idx = missingIndices[i]
+            payload[i * 2] = ((idx shr 8) and 0xFF).toByte()
+            payload[i * 2 + 1] = (idx and 0xFF).toByte()
+        }
+        return RadioPacket(
+            type = TYPE_NACK,
+            messageId = messageId,
+            chunkIndex = count,
+            totalChunks = totalChunks,
+            payload = payload
+        )
+    }
+
+    /**
+     * Unpacks missing chunk indices from a NACK packet.
+     */
+    fun parseNackMissingIndices(packet: RadioPacket): List<Int> {
+        if (packet.type != TYPE_NACK) return emptyList()
+        val count = minOf(packet.chunkIndex, MAX_PAYLOAD_SIZE / 2)
+        val list = mutableListOf<Int>()
+        for (i in 0 until count) {
+            val idx = ((packet.payload[i * 2].toInt() and 0xFF) shl 8) or
+                    (packet.payload[i * 2 + 1].toInt() and 0xFF)
+            list.add(idx)
+        }
+        return list
+    }
+
+    /**
      * Returns true if this packet requires TCP ACK looping.
      */
     fun requiresAck(type: Int): Boolean {
@@ -122,6 +196,9 @@ object PacketParser {
         TYPE_CMD_EDIT -> "CMD_EDIT"
         TYPE_SILENT -> "TEXT_SILENT"
         TYPE_CRITICAL_ALARM -> "TEXT_ALARM"
+        TYPE_HEARTBEAT_PING -> "PING (Heartbeat)"
+        TYPE_HEARTBEAT_PONG -> "PONG (Heartbeat)"
+        TYPE_NACK -> "NACK (Selective Repeat)"
         else -> "UNKNOWN($type)"
     }
 }

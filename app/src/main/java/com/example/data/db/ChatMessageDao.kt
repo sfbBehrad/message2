@@ -21,6 +21,9 @@ interface ChatMessageDao {
     @Query("SELECT * FROM chat_messages WHERE sender = 'PEER' AND status != 'SEEN'")
     suspend fun getUnseenIncomingMessages(): List<ChatMessageEntity>
 
+    @Query("SELECT * FROM chat_messages WHERE sender = 'ME' AND isDeleted = 0 AND status IN ('PENDING', 'SENDING', 'SENT_UNACKED') ORDER BY timestamp ASC")
+    suspend fun getUnackedOutgoingMessages(): List<ChatMessageEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMessage(message: ChatMessageEntity)
 

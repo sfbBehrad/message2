@@ -11,6 +11,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.draggable
@@ -46,17 +47,20 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
+import coil.compose.AsyncImage
 import com.example.data.bluetooth.ConnectionStatus
 import com.example.data.bluetooth.TransportMode
 import com.example.data.model.ChatMessage
 import com.example.data.model.MessageStatus
 import com.example.data.model.RadioPacket
 import com.example.data.model.SenderType
+import com.example.data.model.TopologyState
 import com.example.data.protocol.PacketParser
 import com.example.ui.theme.*
 import com.example.ui.viewmodel.MainTab
 import com.example.ui.viewmodel.RadioChatViewModel
 import com.example.util.NotificationHandler
+import com.example.util.PreSendMetrics
 import kotlinx.coroutines.launch
 import java.io.InputStream
 import java.text.SimpleDateFormat
@@ -77,9 +81,10 @@ fun ChatScreen(
     val messages by viewModel.messages.collectAsState()
     val connectionStatus by viewModel.connectionStatus.collectAsState()
     val deviceName by viewModel.connectedDeviceName.collectAsState()
-    val isTcpMode by viewModel.isTcpMode.collectAsState()
+    val topology by viewModel.topologyState.collectAsState()
     val transportMode by viewModel.transportMode.collectAsState()
     val replyingToMessage by viewModel.replyingToMessage.collectAsState()
+    val activeTransfers by viewModel.activeTransfers.collectAsState()
 
     var textInput by remember { mutableStateOf("") }
     var selectedMessageForAction by remember { mutableStateOf<ChatMessage?>(null) }
@@ -88,20 +93,30 @@ fun ChatScreen(
     var showSendPriorityMenu by remember { mutableStateOf(false) }
     var showTopMenu by remember { mutableStateOf(false) }
 
-    // Keyboard and WindowInsets handling:
-    // Calculates if software keyboard is active
+    // Pre-Send Image Quality Configurator state
+    var pendingImageBytes by remember { mutableStateOf<ByteArray?>(null) }
+    var imageQualitySlider by remember { mutableFloatStateOf(50f) }
+    var preSendMetrics by remember { mutableStateOf<PreSendMetrics?>(null) }
+    var showPreSendSheet by remember { mutableStateOf(false) }
+
+    // Recalculate metrics when quality slider or image changes
+    LaunchedEffect(pendingImageBytes, imageQualitySlider) {
+        val bytes = pendingImageBytes
+        if (bytes != null) {
+            preSendMetrics = viewModel.calculateImagePreSendMetrics(bytes, imageQualitySlider.toInt())
+        }
+    }
+
     val density = LocalDensity.current
     val imeBottom = WindowInsets.ime.getBottom(density)
     val isKeyboardOpen = imeBottom > 0
     val navBarBottom = WindowInsets.navigationBars.getBottom(density)
-    // Only apply navigation bar inset when keyboard is NOT open to prevent stacking gaps
     val bottomGapPadding = if (!isKeyboardOpen) {
         with(density) { navBarBottom.toDp() }
     } else {
         0.dp
     }
 
-    // Stop emergency alarms on enter
     LaunchedEffect(Unit) {
         NotificationHandler.stopAlarm()
         viewModel.markChatAsSeen()
@@ -114,7 +129,7 @@ fun ChatScreen(
         viewModel.markChatAsSeen()
     }
 
-    // File picker launcher
+    // Media picker launcher
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
@@ -124,9 +139,17 @@ fun ChatScreen(
                     val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
                     val bytes = inputStream?.readBytes() ?: return@launch
                     val mimeType = context.contentResolver.getType(uri) ?: ""
-                    val isImage = mimeType.startsWith("image/") || bytes.size < 400000
-                    val fileName = "media_${System.currentTimeMillis()}.${if (isImage) "jpg" else "bin"}"
-                    viewModel.sendFile(bytes, fileName, isImage)
+                    val isImage = mimeType.startsWith("image/") || bytes.size < 2000000
+
+                    if (isImage) {
+                        pendingImageBytes = bytes
+                        imageQualitySlider = 50f
+                        preSendMetrics = viewModel.calculateImagePreSendMetrics(bytes, 50)
+                        showPreSendSheet = true
+                    } else {
+                        val fileName = "doc_${System.currentTimeMillis()}.bin"
+                        viewModel.sendFile(bytes, fileName, isImage = false)
+                    }
                 } catch (e: Exception) {
                     e.printStackTrace()
                     Toast.makeText(context, "Failed to load file", Toast.LENGTH_SHORT).show()
@@ -135,7 +158,6 @@ fun ChatScreen(
         }
     }
 
-    // Root layout using imePadding() cleanly without stacked navigation bar padding
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -143,7 +165,7 @@ fun ChatScreen(
             .imePadding()
             .padding(bottom = bottomGapPadding)
     ) {
-        // Telegram-Style Header Bar matching reference
+        // Telegram-Style Header Bar
         Surface(
             color = TelegramSurface,
             tonalElevation = 4.dp,
@@ -155,33 +177,33 @@ fun ChatScreen(
                     .padding(horizontal = 8.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Navigation / Mode icon
+                // Topology Nav Button
                 IconButton(
-                    onClick = { viewModel.selectTab(MainTab.ANALYTICS) },
+                    onClick = { viewModel.selectTab(MainTab.TOPOLOGY) },
                     modifier = Modifier.size(36.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Default.ArrowBack,
-                        contentDescription = "Analytics & RF",
-                        tint = TextBright
+                        imageVector = Icons.Default.Hub,
+                        contentDescription = "Topology",
+                        tint = TelegramBlue
                     )
                 }
 
                 Spacer(modifier = Modifier.width(4.dp))
 
-                // Avatar Icon (e.g. "EB" circle badge)
+                // Avatar Icon
                 Box(
                     modifier = Modifier
-                        .size(40.dp)
+                        .size(38.dp)
                         .clip(CircleShape)
                         .background(Color(0xFF2AABEE)),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = "EB",
+                        text = "RB",
                         color = Color.White,
                         fontWeight = FontWeight.Bold,
-                        fontSize = 15.sp
+                        fontSize = 14.sp
                     )
                 }
 
@@ -193,19 +215,47 @@ fun ChatScreen(
                         style = MaterialTheme.typography.titleMedium,
                         color = TextBright,
                         fontWeight = FontWeight.SemiBold,
-                        fontSize = 16.sp
+                        fontSize = 15.sp
                     )
-                    Text(
-                        text = when (connectionStatus) {
-                            ConnectionStatus.CONNECTED -> "online"
-                            ConnectionStatus.CONNECTING -> "connecting..."
-                            ConnectionStatus.SCANNING -> "searching for node..."
-                            ConnectionStatus.DISCONNECTED -> "offline"
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (connectionStatus == ConnectionStatus.CONNECTED) TelegramBlue else TextMuted,
-                        fontSize = 12.sp
-                    )
+
+                    // Live Mini-Indicator for E2E Mesh Topology (Requirement 1)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.clickable { viewModel.selectTab(MainTab.TOPOLOGY) }
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    when (topology.statusLevel) {
+                                        TopologyState.StatusLevel.OK -> TelegramGreen
+                                        TopologyState.StatusLevel.WARNING -> TelegramAmber
+                                        TopologyState.StatusLevel.ERROR -> TelegramRed
+                                    }
+                                )
+                        )
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text(
+                            text = "Status: ${topology.statusSummary}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = when (topology.statusLevel) {
+                                TopologyState.StatusLevel.OK -> TelegramGreen
+                                TopologyState.StatusLevel.WARNING -> TelegramAmber
+                                TopologyState.StatusLevel.ERROR -> TelegramRed
+                            },
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                        if (topology.roundTripLatencyMs > 0 && topology.remoteLinkActive) {
+                            Text(
+                                text = " (${topology.roundTripLatencyMs}ms)",
+                                fontSize = 10.sp,
+                                color = TextMuted,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
                 }
 
                 // Options Menu
@@ -227,6 +277,14 @@ fun ChatScreen(
                         modifier = Modifier.background(TelegramSurface)
                     ) {
                         DropdownMenuItem(
+                            text = { Text("Network Dashboard", color = TextBright) },
+                            onClick = {
+                                showTopMenu = false
+                                viewModel.selectTab(MainTab.TOPOLOGY)
+                            },
+                            leadingIcon = { Icon(Icons.Default.Hub, contentDescription = null, tint = TelegramBlue) }
+                        )
+                        DropdownMenuItem(
                             text = { Text("Settings & Retry Limits", color = TextBright) },
                             onClick = {
                                 showTopMenu = false
@@ -242,16 +300,6 @@ fun ChatScreen(
                             },
                             leadingIcon = { Icon(Icons.Default.Insights, contentDescription = null, tint = TelegramBlue) }
                         )
-                        if (transportMode == TransportMode.VIRTUAL_SIMULATOR) {
-                            DropdownMenuItem(
-                                text = { Text("Simulate Node 2 Packet", color = TextBright) },
-                                onClick = {
-                                    showTopMenu = false
-                                    viewModel.simulateIncomingPeerMessage()
-                                },
-                                leadingIcon = { Icon(Icons.Default.Bolt, contentDescription = null, tint = TelegramAmber) }
-                            )
-                        }
                     }
                 }
             }
@@ -278,6 +326,47 @@ fun ChatScreen(
                         fontWeight = FontWeight.Bold,
                         fontSize = 12.sp
                     )
+                }
+            }
+        }
+
+        // Active Selective Repeat Media Transfer Progress Bar
+        if (activeTransfers.isNotEmpty()) {
+            Surface(
+                color = TelegramSurface,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                    activeTransfers.values.forEach { transfer ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = if (transfer.isSender) "Transmitting Media (Selective Repeat)..." else "Receiving Media...",
+                                fontSize = 11.sp,
+                                color = TelegramBlue,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "${transfer.percent}% (${transfer.sentOrReceivedChunks}/${transfer.totalChunks} chunks)",
+                                fontSize = 10.sp,
+                                color = TextMuted,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(3.dp))
+                        LinearProgressIndicator(
+                            progress = { transfer.percent / 100f },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(3.dp)
+                                .clip(RoundedCornerShape(2.dp)),
+                            color = TelegramBlue,
+                            trackColor = Color(0x33FFFFFF)
+                        )
+                    }
                 }
             }
         }
@@ -311,7 +400,7 @@ fun ChatScreen(
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Long-press the Send button to choose priority:\nSilent, Standard with Sound, or Loud Alarm.",
+                        text = "Silent Pings monitor E2E link health.\nLong-press Send for Priority or Emergency Alarm.",
                         style = MaterialTheme.typography.bodySmall,
                         color = TextMuted,
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
@@ -326,7 +415,6 @@ fun ChatScreen(
                         .padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    // Date pill
                     item {
                         Box(
                             modifier = Modifier
@@ -339,9 +427,9 @@ fun ChatScreen(
                                 shape = RoundedCornerShape(12.dp)
                             ) {
                                 Text(
-                                    text = "Today",
+                                    text = "NRF24 Channel 115 • Offline Mesh",
                                     color = TextBright,
-                                    fontSize = 11.sp,
+                                    fontSize = 10.sp,
                                     fontWeight = FontWeight.SemiBold,
                                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 3.dp)
                                 )
@@ -360,7 +448,7 @@ fun ChatScreen(
             }
         }
 
-        // Reply Preview Banner (Above Input Bar)
+        // Reply Preview Banner
         AnimatedVisibility(
             visible = replyingToMessage != null,
             enter = expandVertically() + fadeIn(),
@@ -416,7 +504,7 @@ fun ChatScreen(
             }
         }
 
-        // Telegram-Style Chat Input Bar with Long-Press Send Menu
+        // Chat Input Bar with Long-Press Send Menu
         Surface(
             color = TelegramSurface,
             tonalElevation = 6.dp,
@@ -430,7 +518,7 @@ fun ChatScreen(
             ) {
                 // Attach File / Image button
                 IconButton(
-                    onClick = { filePickerLauncher.launch("*/*") },
+                    onClick = { filePickerLauncher.launch("image/*") },
                     modifier = Modifier
                         .size(38.dp)
                         .testTag("attach_file_btn")
@@ -467,22 +555,13 @@ fun ChatScreen(
                         focusedContainerColor = TelegramBgDark,
                         unfocusedContainerColor = TelegramBgDark
                     ),
-                    trailingIcon = {
-                        Icon(
-                            imageVector = Icons.Default.SentimentSatisfied,
-                            contentDescription = "Emoji",
-                            tint = Color(0xFFA0B0C0),
-                            modifier = Modifier.size(20.dp)
-                        )
-                    },
                     maxLines = 4
                 )
 
                 Spacer(modifier = Modifier.width(4.dp))
 
-                // Send Button with Long-Press Anchor
+                // Send Button with Long-Press Anchor (Telegram Style)
                 Box {
-                    // Send Button Box with combinedClickable for tap vs long-press
                     Box(
                         modifier = Modifier
                             .size(44.dp)
@@ -508,13 +587,12 @@ fun ChatScreen(
                     ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.Send,
-                            contentDescription = "Send (Tap for standard, Hold for priority)",
+                            contentDescription = "Send",
                             tint = Color.White,
                             modifier = Modifier.size(19.dp)
                         )
                     }
 
-                    // Telegram-Style Popup Menu matching reference image
                     if (showSendPriorityMenu) {
                         Popup(
                             alignment = Alignment.BottomEnd,
@@ -552,7 +630,125 @@ fun ChatScreen(
         }
     }
 
-    // Message Options Bottom Sheet / Dialog
+    // Pre-Send Image Quality Configurator ModalBottomSheet (Requirement 3)
+    if (showPreSendSheet && pendingImageBytes != null) {
+        ModalBottomSheet(
+            onDismissRequest = {
+                showPreSendSheet = false
+                pendingImageBytes = null
+            },
+            containerColor = TelegramSurface
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 12.dp)
+            ) {
+                Text(
+                    text = "IMAGE QUALITY CONFIGURATOR",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = TelegramBlue,
+                    fontFamily = FontFamily.Monospace
+                )
+                Text(
+                    text = "Optimize byte size before AES-256 chunking & Selective Repeat blast",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextMuted,
+                    fontSize = 11.sp
+                )
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // Quality Slider & Value
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("JPEG Quality: ${imageQualitySlider.toInt()}%", style = MaterialTheme.typography.bodyMedium, color = TextBright, fontWeight = FontWeight.Bold)
+                    Text("Max Dim: 800px", style = MaterialTheme.typography.bodySmall, color = TextMuted)
+                }
+
+                Slider(
+                    value = imageQualitySlider,
+                    onValueChange = { imageQualitySlider = it },
+                    valueRange = 10f..100f,
+                    steps = 18,
+                    colors = SliderDefaults.colors(
+                        thumbColor = TelegramBlue,
+                        activeTrackColor = TelegramBlue
+                    )
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Dynamic Metrics Display Card
+                preSendMetrics?.let { metrics ->
+                    Card(
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = TelegramBgDark),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column {
+                                    Text("Estimated File Size", fontSize = 10.sp, color = TextMuted)
+                                    Text(metrics.fileSizeFormatted, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TelegramGreen, fontFamily = FontFamily.Monospace)
+                                }
+                                Column {
+                                    Text("Estimated 26B Packets", fontSize = 10.sp, color = TextMuted)
+                                    Text("${metrics.estimatedPackets} packets", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TelegramAmber, fontFamily = FontFamily.Monospace)
+                                }
+                                Column(horizontalAlignment = Alignment.End) {
+                                    Text("Est. Blast Time", fontSize = 10.sp, color = TextMuted)
+                                    Text("~${String.format("%.1f", metrics.estimatedTransferTimeSec)}s", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TelegramBlue, fontFamily = FontFamily.Monospace)
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                showPreSendSheet = false
+                                pendingImageBytes = null
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Cancel")
+                        }
+
+                        Button(
+                            onClick = {
+                                viewModel.sendImageSelectiveRepeat(metrics.compressedBytes, imageQualitySlider.toInt())
+                                showPreSendSheet = false
+                                pendingImageBytes = null
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = TelegramBlue),
+                            modifier = Modifier.weight(1.5f).testTag("confirm_send_image_btn")
+                        ) {
+                            Icon(Icons.Default.Send, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Send (${metrics.estimatedPackets} Packets)")
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+            }
+        }
+    }
+
+    // Message Options Dialog
     selectedMessageForAction?.let { message ->
         AlertDialog(
             onDismissRequest = { selectedMessageForAction = null },
@@ -671,12 +867,6 @@ fun ChatScreen(
     }
 }
 
-/**
- * Telegram-Style Send Priority Menu matching user's reference mockup:
- * 1. Send without sound (VolumeOff icon) -> Type 7
- * 2. Send with sound (VolumeUp icon) -> Type 1
- * 3. Send with loud alarm (Emergency / Siren icon) -> Type 8
- */
 @Composable
 fun TelegramPrioritySendMenu(
     onSelectSilent: () -> Unit,
@@ -691,25 +881,18 @@ fun TelegramPrioritySendMenu(
             .border(1.dp, Color(0xFF2C394B), RoundedCornerShape(12.dp))
     ) {
         Column(modifier = Modifier.padding(vertical = 4.dp)) {
-            // Option 1: Send without sound
             PriorityMenuItem(
                 icon = Icons.Default.VolumeOff,
                 title = "Send without sound",
                 onClick = onSelectSilent
             )
-
             HorizontalDivider(color = Color(0xFF2B3747), thickness = 0.6.dp)
-
-            // Option 2: Send with sound
             PriorityMenuItem(
                 icon = Icons.Default.VolumeUp,
                 title = "Send with sound",
                 onClick = onSelectSound
             )
-
             HorizontalDivider(color = Color(0xFF2B3747), thickness = 0.6.dp)
-
-            // Option 3: Send with loud alarm
             PriorityMenuItem(
                 icon = Icons.Default.Emergency,
                 title = "Send with loud alarm",
@@ -752,7 +935,7 @@ fun PriorityMenuItem(
 }
 
 /**
- * Telegram-style Message Bubble with Swipe-to-Reply and Long-Press.
+ * Telegram-style Message Bubble with Coil AsyncImage and accurate tick statuses.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -888,27 +1071,18 @@ fun TelegramMessageBubble(
                         }
                     }
 
-                    // Media / Image Preview
-                    if (message.fileBytes != null && message.isImage) {
-                        val bitmap = remember(message.fileBytes) {
-                            try {
-                                BitmapFactory.decodeByteArray(message.fileBytes, 0, message.fileBytes.size)
-                            } catch (_: Exception) {
-                                null
-                            }
-                        }
-                        if (bitmap != null) {
-                            Image(
-                                bitmap = bitmap.asImageBitmap(),
-                                contentDescription = "Decrypted Media",
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(170.dp)
-                                    .clip(RoundedCornerShape(10.dp))
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                        }
+                    // Media / Image Preview using Coil AsyncImage (Requirement 3)
+                    if (message.isImage && (message.filePath != null || message.fileBytes != null)) {
+                        AsyncImage(
+                            model = message.filePath ?: message.fileBytes,
+                            contentDescription = "Decrypted Radio Image",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(170.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
                     }
 
                     // Text Content
@@ -992,39 +1166,40 @@ fun TelegramMessageBubble(
 
                         if (isMe) {
                             Spacer(modifier = Modifier.width(4.dp))
+                            // Accurate Delivery Tick System (Requirement 4)
                             when (message.status) {
-                                // Blue ticks for Seen (Type 4)
+                                // 2 Blue Ticks: Read / Seen (Type 4 ACK received)
                                 MessageStatus.SEEN -> {
                                     Icon(
                                         imageVector = Icons.Default.DoneAll,
-                                        contentDescription = "Read (Blue Ticks)",
+                                        contentDescription = "Read (2 Blue Ticks)",
                                         tint = TelegramSeenBlue,
                                         modifier = Modifier.size(15.dp)
                                     )
                                 }
-                                // Double tick for Delivered (Type 3)
+                                // 2 Black/Grey Ticks: Delivered (Type 3 ACK received)
                                 MessageStatus.DELIVERED -> {
                                     Icon(
                                         imageVector = Icons.Default.DoneAll,
-                                        contentDescription = "Delivered (Double Tick)",
-                                        tint = TelegramGreen,
+                                        contentDescription = "Delivered (2 Black Ticks)",
+                                        tint = TextBright,
                                         modifier = Modifier.size(15.dp)
                                     )
                                 }
-                                // Single tick for Sent to ESP32 / UDP
+                                // 1 Black/Grey Tick: Sent to local ESP32
                                 MessageStatus.SENT_UNACKED -> {
                                     Icon(
                                         imageVector = Icons.Default.Check,
-                                        contentDescription = "Sent (Single Tick)",
+                                        contentDescription = "Sent to ESP32 (1 Black Tick)",
                                         tint = TextMuted,
                                         modifier = Modifier.size(13.dp)
                                     )
                                 }
-                                // Sending in-flight
+                                // Clock: In-flight / Attempting
                                 MessageStatus.SENDING, MessageStatus.PENDING -> {
                                     Icon(
                                         imageVector = Icons.Default.AccessTime,
-                                        contentDescription = "In flight",
+                                        contentDescription = "Attempting (Clock)",
                                         tint = TelegramAmber,
                                         modifier = Modifier.size(13.dp)
                                     )

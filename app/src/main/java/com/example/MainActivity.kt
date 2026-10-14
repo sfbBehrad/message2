@@ -1,26 +1,42 @@
 package com.example
 
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import com.example.data.model.TopologyState
 import com.example.ui.screens.AnalyticsScreen
 import com.example.ui.screens.ChatScreen
+import com.example.ui.screens.NetworkDashboardScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.theme.*
 import com.example.ui.viewmodel.MainTab
@@ -33,7 +49,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Stop any active emergency alarm when user returns to the app
         NotificationHandler.stopAlarm()
     }
 
@@ -41,56 +56,222 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Requirement 1: Explicitly set decor fits system windows to false so IME padding works seamlessly
+        // Fix keyboard overlap: set decor fits system windows to false
         WindowCompat.setDecorFitsSystemWindows(window, false)
         enableEdgeToEdge()
 
         setContent {
             RadioBridgeTheme {
+                val context = LocalContext.current
                 val selectedTab by viewModel.selectedTab.collectAsState()
+                val topology by viewModel.topologyState.collectAsState()
                 var showWiringDialog by remember { mutableStateOf(false) }
+
+                // Check physical Bluetooth hardware
+                val isBluetoothHardwarePresent = remember {
+                    BluetoothAdapter.getDefaultAdapter() != null
+                }
+
+                var hasGrantedPermissions by remember { mutableStateOf(false) }
+
+                // Permission launcher for runtime Bluetooth & Notification permissions
+                val permissionLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.RequestMultiplePermissions()
+                ) { permissionsMap ->
+                    val allGranted = permissionsMap.values.all { it }
+                    hasGrantedPermissions = allGranted
+                    if (allGranted && isBluetoothHardwarePresent) {
+                        try {
+                            viewModel.startBluetoothServiceIfPermitted(context)
+                        } catch (e: SecurityException) {
+                            e.printStackTrace()
+                        }
+                    }
+                }
+
+                // Check permissions on startup safely without crashing
+                LaunchedEffect(Unit) {
+                    if (!isBluetoothHardwarePresent) {
+                        // Emulator / Missing hardware bypass: bypass service start entirely
+                        return@LaunchedEffect
+                    }
+
+                    val requiredPermissions = mutableListOf<String>()
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        requiredPermissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+                        requiredPermissions.add(Manifest.permission.BLUETOOTH_SCAN)
+                    } else {
+                        requiredPermissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        requiredPermissions.add(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+
+                    val missing = requiredPermissions.filter {
+                        ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+                    }
+
+                    if (missing.isEmpty()) {
+                        hasGrantedPermissions = true
+                        try {
+                            viewModel.startBluetoothServiceIfPermitted(context)
+                        } catch (e: SecurityException) {
+                            e.printStackTrace()
+                        }
+                    } else {
+                        permissionLauncher.launch(missing.toTypedArray())
+                    }
+                }
 
                 val density = LocalDensity.current
                 val isKeyboardOpen = WindowInsets.ime.getBottom(density) > 0
 
                 Scaffold(
                     topBar = {
-                        TopAppBar(
-                            title = {
-                                Row(modifier = Modifier.fillMaxWidth()) {
-                                    Column {
-                                        Text(
-                                            text = "RadioBridge",
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            color = TelegramBlue
+                        Column {
+                            TopAppBar(
+                                title = {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = "RadioBridge",
+                                                style = MaterialTheme.typography.titleMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                color = TelegramBlue
+                                            )
+                                            Text(
+                                                text = "NRF24L01 + ESP32 • Offline Encrypted Mesh",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = TextMuted,
+                                                fontSize = 11.sp
+                                            )
+                                        }
+
+                                        // Top Live Topology status pill
+                                        Surface(
+                                            shape = CircleShape,
+                                            color = when (topology.statusLevel) {
+                                                TopologyState.StatusLevel.OK -> Color(0xFF0F382A)
+                                                TopologyState.StatusLevel.WARNING -> Color(0xFF382F10)
+                                                TopologyState.StatusLevel.ERROR -> Color(0xFF381515)
+                                            },
+                                            modifier = Modifier
+                                                .clip(CircleShape)
+                                                .clickable { viewModel.selectTab(MainTab.TOPOLOGY) }
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(7.dp)
+                                                        .clip(CircleShape)
+                                                        .background(
+                                                            when (topology.statusLevel) {
+                                                                TopologyState.StatusLevel.OK -> TelegramGreen
+                                                                TopologyState.StatusLevel.WARNING -> TelegramAmber
+                                                                TopologyState.StatusLevel.ERROR -> TelegramRed
+                                                            }
+                                                        )
+                                                )
+                                                Spacer(modifier = Modifier.width(5.dp))
+                                                Text(
+                                                    text = if (topology.isE2EConnected) "E2E OK" else "MESH",
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = when (topology.statusLevel) {
+                                                        TopologyState.StatusLevel.OK -> TelegramGreen
+                                                        TopologyState.StatusLevel.WARNING -> TelegramAmber
+                                                        TopologyState.StatusLevel.ERROR -> TelegramRed
+                                                    }
+                                                )
+                                            }
+                                        }
+                                    }
+                                },
+                                actions = {
+                                    IconButton(
+                                        onClick = { showWiringDialog = true },
+                                        modifier = Modifier.testTag("wiring_info_btn")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Info,
+                                            contentDescription = "Hardware Wiring Guide",
+                                            tint = TelegramBlue
                                         )
+                                    }
+                                },
+                                colors = TopAppBarDefaults.topAppBarColors(
+                                    containerColor = TelegramSurface,
+                                    titleContentColor = TelegramBlue
+                                )
+                            )
+
+                            // Emulator / Missing hardware bypass UI notice
+                            if (!isBluetoothHardwarePresent) {
+                                Surface(
+                                    color = Color(0xFF382F10),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.BluetoothDisabled,
+                                            contentDescription = null,
+                                            tint = TelegramAmber,
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
                                         Text(
-                                            text = "NRF24L01 + ESP32 • Offline Encrypted Mesh",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = TextMuted,
-                                            fontSize = 11.sp
+                                            text = "Bluetooth hardware not detected (Emulator Mode) — Virtual Mesh Simulator active",
+                                            fontSize = 11.sp,
+                                            color = Color(0xFFFFD54F)
                                         )
                                     }
                                 }
-                            },
-                            actions = {
-                                IconButton(
-                                    onClick = { showWiringDialog = true },
-                                    modifier = Modifier.testTag("wiring_info_btn")
+                            } else if (!hasGrantedPermissions) {
+                                Surface(
+                                    color = Color(0xFF1B2838),
+                                    modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Info,
-                                        contentDescription = "Hardware Wiring Guide",
-                                        tint = TelegramBlue
-                                    )
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = "Bluetooth permissions needed for ESP32 bridge",
+                                            fontSize = 11.sp,
+                                            color = TextBright
+                                        )
+                                        TextButton(
+                                            onClick = {
+                                                val required = mutableListOf<String>()
+                                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                                    required.add(Manifest.permission.BLUETOOTH_CONNECT)
+                                                    required.add(Manifest.permission.BLUETOOTH_SCAN)
+                                                } else {
+                                                    required.add(Manifest.permission.ACCESS_FINE_LOCATION)
+                                                }
+                                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                                    required.add(Manifest.permission.POST_NOTIFICATIONS)
+                                                }
+                                                permissionLauncher.launch(required.toTypedArray())
+                                            },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        ) {
+                                            Text("Grant", fontSize = 11.sp, color = TelegramBlue)
+                                        }
+                                    }
                                 }
-                            },
-                            colors = TopAppBarDefaults.topAppBarColors(
-                                containerColor = TelegramSurface,
-                                titleContentColor = TelegramBlue
-                            )
-                        )
+                            }
+                        }
                     },
                     bottomBar = {
                         // Hide bottom navigation bar when keyboard is open or when in Chat screen to avoid stacking gaps
@@ -112,6 +293,21 @@ class MainActivity : ComponentActivity() {
                                         selectedTextColor = TelegramBlue
                                     ),
                                     modifier = Modifier.testTag("nav_chat_tab")
+                                )
+
+                                NavigationBarItem(
+                                    selected = selectedTab == MainTab.TOPOLOGY,
+                                    onClick = { viewModel.selectTab(MainTab.TOPOLOGY) },
+                                    icon = {
+                                        Icon(Icons.Default.Hub, contentDescription = "Topology")
+                                    },
+                                    label = { Text("Topology") },
+                                    colors = NavigationBarItemDefaults.colors(
+                                        indicatorColor = TelegramBlueDark,
+                                        selectedIconColor = Color.White,
+                                        selectedTextColor = TelegramBlue
+                                    ),
+                                    modifier = Modifier.testTag("nav_topology_tab")
                                 )
 
                                 NavigationBarItem(
@@ -159,6 +355,7 @@ class MainActivity : ComponentActivity() {
                     ) {
                         when (selectedTab) {
                             MainTab.CHAT -> ChatScreen(viewModel = viewModel)
+                            MainTab.TOPOLOGY -> NetworkDashboardScreen(viewModel = viewModel)
                             MainTab.ANALYTICS -> AnalyticsScreen(viewModel = viewModel)
                             MainTab.SETTINGS -> SettingsScreen(viewModel = viewModel)
                         }

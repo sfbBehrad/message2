@@ -3,6 +3,8 @@ package com.example.ui.viewmodel
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.AppSettings
+import com.example.data.SettingsDataStore
 import com.example.data.bluetooth.BluetoothService
 import com.example.data.bluetooth.ConnectionStatus
 import com.example.data.bluetooth.DiscoveredDevice
@@ -14,12 +16,15 @@ import com.example.data.model.*
 import com.example.data.protocol.RadioProtocolManager
 import com.example.service.BluetoothForegroundService
 import com.example.util.MediaCompressor
+import com.example.util.MediaTransferManager
 import com.example.util.NotificationHelper
+import com.example.util.PreSendMetrics
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
 enum class MainTab {
     CHAT,
+    TOPOLOGY,
     ANALYTICS,
     SETTINGS
 }
@@ -28,6 +33,7 @@ class RadioChatViewModel(application: Application) : AndroidViewModel(applicatio
 
     private val database = AppDatabase.getDatabase(application)
     val repository = ChatRepository(database.chatMessageDao())
+    val settingsDataStore = SettingsDataStore.getInstance(application)
 
     val bluetoothService = BluetoothService(application.applicationContext)
     val protocolManager = RadioProtocolManager(application.applicationContext, bluetoothService, repository)
@@ -35,28 +41,25 @@ class RadioChatViewModel(application: Application) : AndroidViewModel(applicatio
     private val _selectedTab = MutableStateFlow(MainTab.CHAT)
     val selectedTab: StateFlow<MainTab> = _selectedTab.asStateFlow()
 
-    private val _isTcpMode = MutableStateFlow(true) // Default TCP reliable ACK loop
+    private val _isTcpMode = MutableStateFlow(true)
     val isTcpMode: StateFlow<Boolean> = _isTcpMode.asStateFlow()
-
-    private val _tcpRetryLimit = MutableStateFlow(RadioProtocolManager.DEFAULT_RETRY_LIMIT)
-    val tcpRetryLimit: StateFlow<Int> = _tcpRetryLimit.asStateFlow()
-
-    private val _passphrase = MutableStateFlow(AesSecurity.currentPassphrase)
-    val passphrase: StateFlow<String> = _passphrase.asStateFlow()
-
-    private val _simulatedPacketLoss = MutableStateFlow(0)
-    val simulatedPacketLoss: StateFlow<Int> = _simulatedPacketLoss.asStateFlow()
 
     private val _replyingToMessage = MutableStateFlow<ChatMessage?>(null)
     val replyingToMessage: StateFlow<ChatMessage?> = _replyingToMessage.asStateFlow()
 
-    private val _isForegroundServiceEnabled = MutableStateFlow(false)
-    val isForegroundServiceEnabled: StateFlow<Boolean> = _isForegroundServiceEnabled.asStateFlow()
+    // Persistent Settings from Preferences DataStore
+    val appSettings: StateFlow<AppSettings> = settingsDataStore.settingsFlow.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.Eagerly,
+        initialValue = AppSettings()
+    )
 
-    val connectionStatus: StateFlow<ConnectionStatus> = bluetoothService.connectionStatus
-    val connectedDeviceName: StateFlow<String?> = bluetoothService.connectedDeviceName
-    val discoveredDevices: StateFlow<List<DiscoveredDevice>> = bluetoothService.discoveredDevices
-    val transportMode: StateFlow<TransportMode> = bluetoothService.transportMode
+    // Reactive states from Foreground Service (with fallback to local BluetoothService)
+    val connectionStatus: StateFlow<ConnectionStatus> = BluetoothForegroundService.connectionStatus
+    val connectedDeviceName: StateFlow<String?> = BluetoothForegroundService.connectedDeviceName
+    val discoveredDevices: StateFlow<List<DiscoveredDevice>> = BluetoothForegroundService.discoveredDevices
+    val transportMode: StateFlow<TransportMode> = BluetoothForegroundService.transportMode
+    val topologyState: StateFlow<TopologyState> = BluetoothForegroundService.topologyState
 
     // Flow from Room database
     val messages: StateFlow<List<ChatMessage>> = repository.allMessages.stateIn(
@@ -67,9 +70,36 @@ class RadioChatViewModel(application: Application) : AndroidViewModel(applicatio
 
     val logs: StateFlow<List<PacketLogEntry>> = protocolManager.logs
     val analytics: StateFlow<AnalyticsSnapshot> = protocolManager.analytics
+    val activeTransfers = protocolManager.mediaTransferManager.activeTransfers
 
     init {
         NotificationHelper.createNotificationChannels(application.applicationContext)
+
+        // Sync DataStore values with memory caches
+        viewModelScope.launch {
+            appSettings.collect { settings ->
+                AesSecurity.currentPassphrase = settings.passphrase
+                protocolManager.tcpRetryLimit = settings.tcpRetryLimit
+                bluetoothService.simulatedPacketDropRatePercent = settings.simulatedPacketLoss
+            }
+        }
+    }
+
+    fun startBluetoothServiceIfPermitted(context: android.content.Context) {
+        try {
+            val adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+            if (adapter != null) {
+                BluetoothForegroundService.start(context)
+            }
+        } catch (e: SecurityException) {
+            e.printStackTrace()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    fun isBluetoothHardwareSupported(): Boolean {
+        return android.bluetooth.BluetoothAdapter.getDefaultAdapter() != null
     }
 
     fun selectTab(tab: MainTab) {
@@ -84,8 +114,21 @@ class RadioChatViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun setTcpRetryLimit(limit: Int) {
-        _tcpRetryLimit.value = limit
-        protocolManager.tcpRetryLimit = limit
+        viewModelScope.launch {
+            settingsDataStore.updateTcpRetryLimit(limit)
+        }
+    }
+
+    fun setPingInterval(seconds: Int) {
+        viewModelScope.launch {
+            settingsDataStore.updatePingInterval(seconds)
+        }
+    }
+
+    fun setResendInterval(milliseconds: Long) {
+        viewModelScope.launch {
+            settingsDataStore.updateResendInterval(milliseconds)
+        }
     }
 
     fun setReplyingTo(message: ChatMessage?) {
@@ -93,28 +136,35 @@ class RadioChatViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun setTransportMode(mode: TransportMode) {
-        bluetoothService.setTransportMode(mode)
+        BluetoothForegroundService.instance?.setTransportMode(mode) ?: bluetoothService.setTransportMode(mode)
     }
 
     fun setSimulatedPacketLoss(percent: Int) {
-        _simulatedPacketLoss.value = percent
-        bluetoothService.simulatedPacketDropRatePercent = percent
+        viewModelScope.launch {
+            settingsDataStore.updateSimulatedPacketLoss(percent)
+        }
     }
 
     fun updatePassphrase(newPhrase: String) {
-        _passphrase.value = newPhrase
-        AesSecurity.currentPassphrase = newPhrase
+        viewModelScope.launch {
+            settingsDataStore.updatePassphrase(newPhrase)
+        }
     }
 
-    fun toggleForegroundService(enable: Boolean) {
-        _isForegroundServiceEnabled.value = enable
-        val context = getApplication<Application>().applicationContext
-        if (enable) {
-            val name = connectedDeviceName.value ?: "ESP32 Bridge"
-            BluetoothForegroundService.start(context, "Active: $name • NRF24 Ch 115")
-        } else {
-            BluetoothForegroundService.stop(context)
+    fun updateTargetNode(nodeName: String) {
+        viewModelScope.launch {
+            settingsDataStore.updateTargetNode(nodeName)
         }
+    }
+
+    fun updateDefaultImageQuality(quality: Int) {
+        viewModelScope.launch {
+            settingsDataStore.updateDefaultImageQuality(quality)
+        }
+    }
+
+    fun triggerImmediatePing() {
+        BluetoothForegroundService.triggerPingNow()
     }
 
     fun sendTextMessage(text: String, headerType: Int? = null) {
@@ -130,8 +180,31 @@ class RadioChatViewModel(application: Application) : AndroidViewModel(applicatio
         _replyingToMessage.value = null
     }
 
+    /**
+     * Calculates image preview metrics dynamically for the Quality Configurator BottomSheet.
+     */
+    fun calculateImagePreSendMetrics(bytes: ByteArray, quality: Int): PreSendMetrics? {
+        return MediaTransferManager.calculatePreSendMetrics(bytes, quality)
+    }
+
+    /**
+     * Sends image via Selective Repeat ARQ.
+     */
+    fun sendImageSelectiveRepeat(compressedBytes: ByteArray, quality: Int) {
+        protocolManager.sendImageSelectiveRepeat(compressedBytes, quality)
+    }
+
     fun sendFile(fileBytes: ByteArray, fileName: String, isImage: Boolean) {
-        protocolManager.sendFile(fileBytes, fileName, isImage)
+        if (isImage) {
+            val metrics = MediaTransferManager.calculatePreSendMetrics(fileBytes, appSettings.value.defaultImageQuality)
+            val bytes = metrics?.compressedBytes ?: fileBytes
+            protocolManager.sendImageSelectiveRepeat(bytes, appSettings.value.defaultImageQuality)
+        } else {
+            // Legacy/generic binary file
+            val metrics = MediaTransferManager.calculatePreSendMetrics(fileBytes, 50)
+            val bytes = metrics?.compressedBytes ?: fileBytes
+            protocolManager.sendImageSelectiveRepeat(bytes, 50)
+        }
     }
 
     fun deleteMessage(message: ChatMessage) {
@@ -149,19 +222,27 @@ class RadioChatViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun connectToDevice(address: String, name: String) {
-        bluetoothService.connectToDevice(address, name)
+        BluetoothForegroundService.instance?.connectToBluetoothDevice(address, name) ?: bluetoothService.connectToDevice(address, name)
     }
 
     fun connectQuickNode(nodeName: String) {
-        bluetoothService.connectToNodeByName(nodeName)
+        BluetoothForegroundService.instance?.let { service ->
+            service.refreshPairedDevices()
+            val match = BluetoothForegroundService.discoveredDevices.value.find { it.name.equals(nodeName, ignoreCase = true) }
+            if (match != null) {
+                service.connectToBluetoothDevice(match.address, match.name)
+            } else {
+                service.connectToBluetoothDevice(nodeName, nodeName)
+            }
+        } ?: bluetoothService.connectToNodeByName(nodeName)
     }
 
     fun disconnect() {
-        bluetoothService.disconnect()
+        BluetoothForegroundService.instance?.disconnectSocket() ?: bluetoothService.disconnect()
     }
 
     fun refreshDevices() {
-        bluetoothService.refreshPairedDevices()
+        BluetoothForegroundService.instance?.refreshPairedDevices() ?: bluetoothService.refreshPairedDevices()
     }
 
     fun clearLogs() {
@@ -171,44 +252,6 @@ class RadioChatViewModel(application: Application) : AndroidViewModel(applicatio
     fun clearChatHistory() {
         viewModelScope.launch {
             repository.clearAll()
-        }
-    }
-
-    /**
-     * Injects a simulated peer incoming message from Node 2 (with GZIP + AES)
-     */
-    fun simulateIncomingPeerMessage(customText: String? = null) {
-        viewModelScope.launch {
-            val text = customText ?: "Hello from Node 2! NRF24 signal RSSI optimal on Channel 115."
-            val plainBytes = text.toByteArray(Charsets.UTF_8)
-            val gzipped = MediaCompressor.gzipCompress(plainBytes)
-            val encryptedBytes = AesSecurity.encrypt(gzipped)
-
-            val totalEncryptedLen = encryptedBytes.size
-            val stream = ByteArray(4 + totalEncryptedLen)
-            stream[0] = ((totalEncryptedLen shr 24) and 0xFF).toByte()
-            stream[1] = ((totalEncryptedLen shr 16) and 0xFF).toByte()
-            stream[2] = ((totalEncryptedLen shr 8) and 0xFF).toByte()
-            stream[3] = (totalEncryptedLen and 0xFF).toByte()
-            System.arraycopy(encryptedBytes, 0, stream, 4, totalEncryptedLen)
-
-            val totalChunks = (stream.size + RadioPacket.MAX_PAYLOAD_SIZE - 1) / RadioPacket.MAX_PAYLOAD_SIZE
-            val msgId = (10..240).random()
-
-            for (i in 0 until totalChunks) {
-                val start = i * RadioPacket.MAX_PAYLOAD_SIZE
-                val end = minOf(start + RadioPacket.MAX_PAYLOAD_SIZE, stream.size)
-                val chunkData = stream.sliceArray(start until end)
-
-                val packet = RadioPacket(
-                    type = RadioPacket.TYPE_TCP_TEXT,
-                    messageId = msgId,
-                    chunkIndex = i,
-                    totalChunks = totalChunks,
-                    payload = chunkData
-                )
-                bluetoothService.injectSimulatedPacket(packet)
-            }
         }
     }
 }

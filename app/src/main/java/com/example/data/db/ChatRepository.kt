@@ -23,6 +23,10 @@ class ChatRepository(private val dao: ChatMessageDao) {
         return dao.getUnseenIncomingMessages().map { ChatMessage.fromEntity(it) }
     }
 
+    suspend fun getUnackedOutgoingMessages(): List<ChatMessage> {
+        return dao.getUnackedOutgoingMessages().map { ChatMessage.fromEntity(it) }
+    }
+
     suspend fun insertMessage(message: ChatMessage) {
         dao.insertMessage(message.toEntity())
     }

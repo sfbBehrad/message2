@@ -8,12 +8,12 @@ enum class SenderType {
 }
 
 enum class MessageStatus {
-    PENDING,
-    SENDING,
-    SENT_UNACKED,   // Single tick (sent to ESP32 / UDP)
-    DELIVERED,      // Double tick (Type 3 ACK received)
-    SEEN,           // Blue ticks (Type 4 ACK Seen received)
-    FAILED
+    PENDING,        // Clock 🕒 (Attempting)
+    SENDING,        // Clock 🕒 (Transmitting chunks)
+    SENT_UNACKED,   // 1 Black/Grey Tick ✓ (Sent to local ESP32 / UDP)
+    DELIVERED,      // 2 Black/Grey Ticks ✓✓ (Type 3 ACK received from remote node)
+    SEEN,           // 2 Blue Ticks ✓✓ (Type 4 ACK Seen received from peer user)
+    FAILED          // Red exclamation ✕
 }
 
 data class ChatMessage(
@@ -23,6 +23,7 @@ data class ChatMessage(
     val type: Int,
     val textContent: String? = null,
     val fileBytes: ByteArray? = null,
+    val filePath: String? = null, // Absolute path to cached JPG for Coil
     val fileName: String? = null,
     val isImage: Boolean = false,
     val timestamp: Long = System.currentTimeMillis(),
@@ -42,6 +43,7 @@ data class ChatMessage(
         type = type,
         textContent = textContent,
         fileBytes = fileBytes,
+        filePath = filePath,
         fileName = fileName,
         isImage = isImage,
         timestamp = timestamp,
@@ -63,6 +65,7 @@ data class ChatMessage(
             type = entity.type,
             textContent = entity.textContent,
             fileBytes = entity.fileBytes,
+            filePath = entity.filePath,
             fileName = entity.fileName,
             isImage = entity.isImage,
             timestamp = entity.timestamp,
