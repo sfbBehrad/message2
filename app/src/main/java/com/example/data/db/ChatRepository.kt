@@ -19,6 +19,14 @@ class ChatRepository(private val dao: ChatMessageDao) {
         return dao.getLatestOutgoingByByteId(byteId)?.let { ChatMessage.fromEntity(it) }
     }
 
+    suspend fun getLatestIncomingByByteId(byteId: Int): ChatMessage? {
+        return dao.getLatestIncomingByByteId(byteId)?.let { ChatMessage.fromEntity(it) }
+    }
+
+    suspend fun markIncomingAsDeletedByByteId(byteId: Int) {
+        dao.markIncomingAsDeletedByByteId(byteId)
+    }
+
     suspend fun getUnseenIncomingMessages(): List<ChatMessage> {
         return dao.getUnseenIncomingMessages().map { ChatMessage.fromEntity(it) }
     }

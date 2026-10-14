@@ -243,6 +243,14 @@ class MediaTransferManager(private val context: Context) {
         }
     }
 
+    fun trimTrailingZeros(bytes: ByteArray): ByteArray {
+        var end = bytes.size
+        while (end > 0 && bytes[end - 1] == 0.toByte()) {
+            end--
+        }
+        return if (end == bytes.size) bytes else bytes.copyOf(end)
+    }
+
     private fun reconstructBytes(totalChunks: Int, chunksMap: Map<Int, ByteArray>): ByteArray? {
         return try {
             val totalBytes = totalChunks * RadioPacket.MAX_PAYLOAD_SIZE
@@ -254,17 +262,47 @@ class MediaTransferManager(private val context: Context) {
                 offset += RadioPacket.MAX_PAYLOAD_SIZE
             }
 
-            if (combined.size < 4) return null
-            val totalLen = ((combined[0].toInt() and 0xFF) shl 24) or
-                    ((combined[1].toInt() and 0xFF) shl 16) or
-                    ((combined[2].toInt() and 0xFF) shl 8) or
-                    (combined[3].toInt() and 0xFF)
+            // CRITICAL FIX: Trim 0x00 padding bytes from the final chunk of the reassembled byte array
+            val trimmedReassembled = trimTrailingZeros(combined)
+            if (trimmedReassembled.isEmpty()) return null
 
-            if (totalLen <= 0 || totalLen > combined.size - 4) return null
-            val encryptedBytes = combined.sliceArray(4 until (4 + totalLen))
+            val rawPayload = if (trimmedReassembled.size >= 4) {
+                val totalLen = ((trimmedReassembled[0].toInt() and 0xFF) shl 24) or
+                        ((trimmedReassembled[1].toInt() and 0xFF) shl 16) or
+                        ((trimmedReassembled[2].toInt() and 0xFF) shl 8) or
+                        (trimmedReassembled[3].toInt() and 0xFF)
 
-            val decryptedRaw = AesSecurity.decrypt(encryptedBytes) ?: return null
-            MediaCompressor.gzipDecompress(decryptedRaw)
+                if (totalLen in 1..(trimmedReassembled.size - 4)) {
+                    trimmedReassembled.sliceArray(4 until (4 + totalLen))
+                } else {
+                    trimmedReassembled
+                }
+            } else {
+                trimmedReassembled
+            }
+
+            // Attempt AES decrypt
+            val decryptedRaw = AesSecurity.decrypt(rawPayload)
+                ?: AesSecurity.decrypt(trimmedReassembled)
+                ?: rawPayload
+
+            // CRITICAL FIX: Trim trailing zeros from reassembled/decrypted byte array BEFORE decompressing it
+            val toDecompress = trimTrailingZeros(decryptedRaw)
+
+            try {
+                MediaCompressor.gzipDecompress(toDecompress)
+            } catch (e: Exception) {
+                // If already raw JPEG (magic header 0xFF 0xD8), return directly
+                if (toDecompress.size >= 2 && toDecompress[0] == 0xFF.toByte() && toDecompress[1] == 0xD8.toByte()) {
+                    toDecompress
+                } else {
+                    try {
+                        MediaCompressor.gzipDecompress(trimTrailingZeros(rawPayload))
+                    } catch (_: Exception) {
+                        toDecompress
+                    }
+                }
+            }
         } catch (e: Exception) {
             e.printStackTrace()
             null

@@ -13,7 +13,10 @@ enum class MessageStatus {
     SENT_UNACKED,   // 1 Black/Grey Tick ✓ (Sent to local ESP32 / UDP)
     DELIVERED,      // 2 Black/Grey Ticks ✓✓ (Type 3 ACK received from remote node)
     SEEN,           // 2 Blue Ticks ✓✓ (Type 4 ACK Seen received from peer user)
-    FAILED          // Red exclamation ✕
+    READ,           // 2 Blue Ticks ✓✓ (Type 4 ACK Read alias)
+    FAILED,         // Red exclamation ✕
+    COMPLETED,      // Media download completed
+    DELETED         // This message was deleted
 }
 
 data class ChatMessage(
@@ -73,14 +76,18 @@ data class ChatMessage(
             currentChunk = entity.currentChunk,
             retriesCurrentChunk = entity.retriesCurrentChunk,
             status = try {
-                MessageStatus.valueOf(entity.status)
+                if (entity.isDeleted || entity.status.equals("DELETED", ignoreCase = true)) {
+                    MessageStatus.DELETED
+                } else {
+                    MessageStatus.valueOf(entity.status)
+                }
             } catch (_: Exception) {
-                MessageStatus.DELIVERED
+                if (entity.isDeleted) MessageStatus.DELETED else MessageStatus.DELIVERED
             },
             replyToId = entity.replyToId,
             replyToText = entity.replyToText,
             isEdited = entity.isEdited,
-            isDeleted = entity.isDeleted
+            isDeleted = entity.isDeleted || entity.status.equals("DELETED", ignoreCase = true)
         )
     }
 }

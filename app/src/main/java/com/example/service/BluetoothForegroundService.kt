@@ -568,6 +568,19 @@ class BluetoothForegroundService : Service() {
                     val unacked = repository.getUnackedOutgoingMessages()
                     for (msg in unacked) {
                         if (!isActive) break
+
+                        // Strict DB state check before re-transmission (cancel if already DELIVERED / SEEN / DELETED)
+                        val current = repository.getMessageById(msg.id)
+                        if (current == null ||
+                            current.status == MessageStatus.DELIVERED ||
+                            current.status == MessageStatus.SEEN ||
+                            current.status == MessageStatus.READ ||
+                            current.status == MessageStatus.COMPLETED ||
+                            current.status == MessageStatus.DELETED ||
+                            current.isDeleted) {
+                            continue
+                        }
+
                         // Resend unacked TCP message chunks
                         if (msg.type != RadioPacket.TYPE_UDP_TEXT && msg.textContent != null) {
                             val stream = RadioProtocolManager.prepareFramedStream(msg.textContent)

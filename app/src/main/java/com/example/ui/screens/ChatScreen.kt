@@ -99,6 +99,16 @@ fun ChatScreen(
     var preSendMetrics by remember { mutableStateOf<PreSendMetrics?>(null) }
     var showPreSendSheet by remember { mutableStateOf(false) }
 
+    // In-App Notification dismiss state for Media Transfer Banner
+    var isMediaBannerDismissed by remember { mutableStateOf(false) }
+
+    // Re-show banner if a new media transfer starts
+    LaunchedEffect(activeTransfers.keys) {
+        if (activeTransfers.isNotEmpty()) {
+            isMediaBannerDismissed = false
+        }
+    }
+
     // Recalculate metrics when quality slider or image changes
     LaunchedEffect(pendingImageBytes, imageQualitySlider) {
         val bytes = pendingImageBytes
@@ -330,8 +340,12 @@ fun ChatScreen(
             }
         }
 
-        // Active Selective Repeat Media Transfer Progress Bar
-        if (activeTransfers.isNotEmpty()) {
+        // In-App Notification: Active Media Transfer Banner (Dismissible with "X" / Minimized pill)
+        AnimatedVisibility(
+            visible = activeTransfers.isNotEmpty() && !isMediaBannerDismissed,
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut()
+        ) {
             Surface(
                 color = TelegramSurface,
                 modifier = Modifier.fillMaxWidth()
@@ -343,18 +357,44 @@ fun ChatScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                text = if (transfer.isSender) "Transmitting Media (Selective Repeat)..." else "Receiving Media...",
-                                fontSize = 11.sp,
-                                color = TelegramBlue,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Text(
-                                text = "${transfer.percent}% (${transfer.sentOrReceivedChunks}/${transfer.totalChunks} chunks)",
-                                fontSize = 10.sp,
-                                color = TextMuted,
-                                fontFamily = FontFamily.Monospace
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    imageVector = if (transfer.isSender) Icons.Default.CloudUpload else Icons.Default.CloudDownload,
+                                    contentDescription = null,
+                                    tint = TelegramBlue,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (transfer.isSender) "Transmitting Media..." else "Receiving Media...",
+                                    fontSize = 11.sp,
+                                    color = TelegramBlue,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "${transfer.percent}% (${transfer.sentOrReceivedChunks}/${transfer.totalChunks})",
+                                    fontSize = 10.sp,
+                                    color = TextMuted,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+
+                            // Close / Dismiss button
+                            IconButton(
+                                onClick = { isMediaBannerDismissed = true },
+                                modifier = Modifier.size(24.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Dismiss Banner",
+                                    tint = TextMuted,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
                         }
                         Spacer(modifier = Modifier.height(3.dp))
                         LinearProgressIndicator(
@@ -367,6 +407,36 @@ fun ChatScreen(
                             trackColor = Color(0x33FFFFFF)
                         )
                     }
+                }
+            }
+        }
+
+        // Minimized banner indicator when user dismissed while downloading
+        if (activeTransfers.isNotEmpty() && isMediaBannerDismissed) {
+            Surface(
+                color = Color(0x33000000),
+                shape = CircleShape,
+                modifier = Modifier
+                    .align(Alignment.End)
+                    .padding(horizontal = 12.dp, vertical = 2.dp)
+                    .clickable { isMediaBannerDismissed = false }
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.CloudDownload,
+                        contentDescription = null,
+                        tint = TelegramBlue,
+                        modifier = Modifier.size(12.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "Transfer in background (Tap to view)",
+                        fontSize = 10.sp,
+                        color = TextMuted
+                    )
                 }
             }
         }
@@ -819,7 +889,7 @@ fun ChatScreen(
                         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Default.Delete, contentDescription = null, tint = TelegramRed)
                             Spacer(modifier = Modifier.width(12.dp))
-                            Text("Delete Message (Type 5)", color = TelegramRed)
+                            Text("Delete for Everyone (Type 5)", color = TelegramRed)
                         }
                     }
                 }
@@ -945,6 +1015,7 @@ fun TelegramMessageBubble(
     onLongPress: () -> Unit
 ) {
     val isMe = message.sender == SenderType.ME
+    val isDeleted = message.isDeleted || message.status == MessageStatus.DELETED
     val timeFormat = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
     val formattedTime = remember(message.timestamp) { timeFormat.format(Date(message.timestamp)) }
 
@@ -960,7 +1031,7 @@ fun TelegramMessageBubble(
             .draggable(
                 orientation = Orientation.Horizontal,
                 state = rememberDraggableState { delta ->
-                    if (delta > 0 || offsetX.value > 0) {
+                    if (!isDeleted && (delta > 0 || offsetX.value > 0)) {
                         coroutineScope.launch {
                             val newOffset = (offsetX.value + delta).coerceIn(0f, 100f)
                             offsetX.snapTo(newOffset)
@@ -968,7 +1039,7 @@ fun TelegramMessageBubble(
                     }
                 },
                 onDragStopped = {
-                    if (offsetX.value > 50f) {
+                    if (!isDeleted && offsetX.value > 50f) {
                         onSwipeReply()
                     }
                     coroutineScope.launch {
@@ -977,7 +1048,7 @@ fun TelegramMessageBubble(
                 }
             )
     ) {
-        if (offsetX.value > 10f) {
+        if (!isDeleted && offsetX.value > 10f) {
             Box(
                 modifier = Modifier
                     .align(Alignment.CenterStart)
@@ -1011,128 +1082,151 @@ fun TelegramMessageBubble(
                     .border(0.8.dp, bubbleBorder, RoundedCornerShape(16.dp))
                     .combinedClickable(
                         onClick = {},
-                        onLongClick = onLongPress
+                        onLongClick = if (isDeleted) null else onLongPress
                     )
             ) {
                 Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)) {
 
-                    // Replied message preview header
-                    if (!message.replyToText.isNullOrBlank()) {
-                        Surface(
-                            color = Color(0x22000000),
-                            shape = RoundedCornerShape(6.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(bottom = 6.dp)
+                    if (isDeleted) {
+                        // Deleted message UI: placeholder in italics with trash icon, no interactions
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(vertical = 4.dp, horizontal = 2.dp)
                         ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                            Icon(
+                                imageVector = Icons.Default.DeleteOutline,
+                                contentDescription = "Deleted message",
+                                tint = TextMuted,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "This message was deleted.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = TextMuted,
+                                fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+                                fontSize = 13.sp
+                            )
+                        }
+                    } else {
+                        // Replied message preview header
+                        if (!message.replyToText.isNullOrBlank()) {
+                            Surface(
+                                color = Color(0x22000000),
+                                shape = RoundedCornerShape(6.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 6.dp)
                             ) {
-                                Box(
-                                    modifier = Modifier
-                                        .width(3.dp)
-                                        .height(24.dp)
-                                        .background(TelegramBlue, RoundedCornerShape(2.dp))
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Column {
-                                    Text(
-                                        text = "Replied",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = TelegramBlue,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 10.sp
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .width(3.dp)
+                                            .height(24.dp)
+                                            .background(TelegramBlue, RoundedCornerShape(2.dp))
                                     )
-                                    Text(
-                                        text = message.replyToText,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = TextBright,
-                                        maxLines = 1,
-                                        fontSize = 10.sp
-                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Column {
+                                        Text(
+                                            text = "Replied",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = TelegramBlue,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 10.sp
+                                        )
+                                        Text(
+                                            text = message.replyToText,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = TextBright,
+                                            maxLines = 1,
+                                            fontSize = 10.sp
+                                        )
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    // Priority Badge (Silent or Emergency Alarm)
-                    if (message.type == RadioPacket.TYPE_SILENT) {
-                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 2.dp)) {
-                            Icon(Icons.Default.VolumeOff, contentDescription = null, tint = TextMuted, modifier = Modifier.size(12.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Silent", color = TextMuted, fontSize = 9.sp)
+                        // Priority Badge (Silent or Emergency Alarm)
+                        if (message.type == RadioPacket.TYPE_SILENT) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 2.dp)) {
+                                Icon(Icons.Default.VolumeOff, contentDescription = null, tint = TextMuted, modifier = Modifier.size(12.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Silent", color = TextMuted, fontSize = 9.sp)
+                            }
+                        } else if (message.type == RadioPacket.TYPE_CRITICAL_ALARM) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 2.dp)) {
+                                Icon(Icons.Default.Emergency, contentDescription = null, tint = TelegramAmber, modifier = Modifier.size(12.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("CRITICAL ALARM", color = TelegramAmber, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            }
                         }
-                    } else if (message.type == RadioPacket.TYPE_CRITICAL_ALARM) {
-                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 2.dp)) {
-                            Icon(Icons.Default.Emergency, contentDescription = null, tint = TelegramAmber, modifier = Modifier.size(12.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("CRITICAL ALARM", color = TelegramAmber, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                        }
-                    }
 
-                    // Media / Image Preview using Coil AsyncImage (Requirement 3)
-                    if (message.isImage && (message.filePath != null || message.fileBytes != null)) {
-                        AsyncImage(
-                            model = message.filePath ?: message.fileBytes,
-                            contentDescription = "Decrypted Radio Image",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(170.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                    }
-
-                    // Text Content
-                    if (!message.textContent.isNullOrBlank()) {
-                        Text(
-                            text = message.textContent,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = if (message.isDeleted) TextMuted else TextBright,
-                            fontSize = 14.sp,
-                            lineHeight = 18.sp
-                        )
-                    }
-
-                    // Progress bar for multi-chunk transfers
-                    if (message.totalChunks > 1 && message.status == MessageStatus.SENDING) {
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Column {
-                            val progress = if (message.totalChunks > 0)
-                                message.currentChunk.toFloat() / message.totalChunks.toFloat()
-                            else 0f
-
-                            LinearProgressIndicator(
-                                progress = { progress },
+                        // Media / Image Preview using Coil AsyncImage (Requirement 3)
+                        if (message.isImage && (message.filePath != null || message.fileBytes != null)) {
+                            AsyncImage(
+                                model = message.filePath ?: message.fileBytes,
+                                contentDescription = "Decrypted Radio Image",
+                                contentScale = ContentScale.Crop,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .height(3.dp)
-                                    .clip(RoundedCornerShape(2.dp)),
-                                color = TelegramBlue,
-                                trackColor = Color(0x33FFFFFF)
+                                    .height(170.dp)
+                                    .clip(RoundedCornerShape(10.dp))
                             )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(
-                                    text = "Chunk ${message.currentChunk}/${message.totalChunks} (32B)",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontSize = 9.sp,
-                                    color = TextMuted,
-                                    fontFamily = FontFamily.Monospace
+                            Spacer(modifier = Modifier.height(4.dp))
+                        }
+
+                        // Text Content
+                        if (!message.textContent.isNullOrBlank()) {
+                            Text(
+                                text = message.textContent,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = TextBright,
+                                fontSize = 14.sp,
+                                lineHeight = 18.sp
+                            )
+                        }
+
+                        // Progress bar for multi-chunk transfers
+                        if (message.totalChunks > 1 && message.status == MessageStatus.SENDING) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Column {
+                                val progress = if (message.totalChunks > 0)
+                                    message.currentChunk.toFloat() / message.totalChunks.toFloat()
+                                else 0f
+
+                                LinearProgressIndicator(
+                                    progress = { progress },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(3.dp)
+                                        .clip(RoundedCornerShape(2.dp)),
+                                    color = TelegramBlue,
+                                    trackColor = Color(0x33FFFFFF)
                                 )
-                                if (message.retriesCurrentChunk > 0) {
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
                                     Text(
-                                        text = "retry #${message.retriesCurrentChunk}",
+                                        text = "Chunk ${message.currentChunk}/${message.totalChunks} (32B)",
                                         style = MaterialTheme.typography.labelSmall,
                                         fontSize = 9.sp,
-                                        color = TelegramAmber,
+                                        color = TextMuted,
                                         fontFamily = FontFamily.Monospace
                                     )
+                                    if (message.retriesCurrentChunk > 0) {
+                                        Text(
+                                            text = "retry #${message.retriesCurrentChunk}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontSize = 9.sp,
+                                            color = TelegramAmber,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1146,7 +1240,7 @@ fun TelegramMessageBubble(
                         horizontalArrangement = Arrangement.End,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        if (message.isEdited) {
+                        if (!isDeleted && message.isEdited) {
                             Text(
                                 text = "edited",
                                 style = MaterialTheme.typography.labelSmall,
@@ -1164,12 +1258,12 @@ fun TelegramMessageBubble(
                             fontSize = 10.sp
                         )
 
-                        if (isMe) {
+                        if (isMe && !isDeleted) {
                             Spacer(modifier = Modifier.width(4.dp))
                             // Accurate Delivery Tick System (Requirement 4)
                             when (message.status) {
                                 // 2 Blue Ticks: Read / Seen (Type 4 ACK received)
-                                MessageStatus.SEEN -> {
+                                MessageStatus.SEEN, MessageStatus.READ -> {
                                     Icon(
                                         imageVector = Icons.Default.DoneAll,
                                         contentDescription = "Read (2 Blue Ticks)",
@@ -1178,7 +1272,7 @@ fun TelegramMessageBubble(
                                     )
                                 }
                                 // 2 Black/Grey Ticks: Delivered (Type 3 ACK received)
-                                MessageStatus.DELIVERED -> {
+                                MessageStatus.DELIVERED, MessageStatus.COMPLETED -> {
                                     Icon(
                                         imageVector = Icons.Default.DoneAll,
                                         contentDescription = "Delivered (2 Black Ticks)",
@@ -1213,6 +1307,7 @@ fun TelegramMessageBubble(
                                         modifier = Modifier.size(14.dp)
                                     )
                                 }
+                                MessageStatus.DELETED -> {}
                             }
                         }
                     }

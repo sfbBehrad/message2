@@ -74,6 +74,9 @@ class RadioProtocolManager(
     // Active Selective Repeat outgoing packets: messageId -> Map<chunkIndex, RadioPacket>
     private val activeOutgoingMediaPackets = ConcurrentHashMap<Int, Map<Int, RadioPacket>>()
 
+    // Active retry jobs for text messages: uuid -> Job
+    private val activeRetryJobs = ConcurrentHashMap<String, Job>()
+
     init {
         // Collect incoming packets from Foreground Service (or fallback bluetoothService)
         scope.launch {
@@ -249,18 +252,29 @@ class RadioProtocolManager(
                 val key = ackKey(packet.messageId, packet.chunkIndex)
                 pendingAcks[key]?.complete(Unit)
 
+                repository.updateStatusByByteId(packet.messageId, MessageStatus.DELIVERED)
+                val outgoing = repository.getLatestOutgoingByByteId(packet.messageId)
+                if (outgoing != null) {
+                    activeRetryJobs[outgoing.id]?.cancel()
+                    activeRetryJobs.remove(outgoing.id)
+                }
+
                 // Complete whole file transfer if it's the final chunk or whole-file ACK
                 if (packet.chunkIndex == packet.totalChunks - 1 || packet.chunkIndex == 0) {
-                    repository.updateStatusByByteId(packet.messageId, MessageStatus.DELIVERED)
                     activeOutgoingMediaPackets.remove(packet.messageId)
                     mediaTransferManager.updateProgress(packet.messageId, packet.totalChunks, packet.totalChunks, isSender = true, isComplete = true)
                     NotificationHelper.showMessageDeliveredNotification(context, "Radio Message #${packet.messageId}")
                 }
             }
 
-            // Type 4: ACK Seen (Blue Ticks ✓✓)
+            // Type 4: ACK Seen / Read (Blue Ticks ✓✓)
             RadioPacket.TYPE_ACK_SEEN -> {
                 repository.updateStatusByByteId(packet.messageId, MessageStatus.SEEN)
+                val outgoing = repository.getLatestOutgoingByByteId(packet.messageId)
+                if (outgoing != null) {
+                    activeRetryJobs[outgoing.id]?.cancel()
+                    activeRetryJobs.remove(outgoing.id)
+                }
             }
 
             // Type 11: NACK (Selective Repeat: Resend only missing chunks requested by receiver)
@@ -299,6 +313,7 @@ class RadioProtocolManager(
                             )
                             transmitPacket(ack)
 
+                            // Save absolute path to Room DB and mark state as COMPLETED so Coil loads it immediately
                             val chatMsg = ChatMessage(
                                 id = UUID.randomUUID().toString(),
                                 messageIdByte = packet.messageId,
@@ -311,7 +326,7 @@ class RadioProtocolManager(
                                 isImage = true,
                                 totalChunks = packet.totalChunks,
                                 currentChunk = packet.totalChunks,
-                                status = MessageStatus.DELIVERED
+                                status = MessageStatus.COMPLETED
                             )
                             repository.insertMessage(chatMsg)
                             com.example.util.NotificationHandler.handleIncomingNotification(
@@ -325,12 +340,15 @@ class RadioProtocolManager(
                 )
             }
 
-            // Type 5: Remote Delete Message Command
+            // Type 5: Remote Delete Message Command (Bidirectional Deletion)
             RadioPacket.TYPE_CMD_DELETE -> {
                 val targetMsgId = packet.messageId
-                val existing = repository.getLatestOutgoingByByteId(targetMsgId)
+                // The receiver received this message from PEER
+                val existing = repository.getLatestIncomingByByteId(targetMsgId)
                 if (existing != null) {
                     repository.markAsDeleted(existing.id)
+                } else {
+                    repository.markIncomingAsDeletedByByteId(targetMsgId)
                 }
             }
 
@@ -448,7 +466,7 @@ class RadioProtocolManager(
         replyToId: String? = null,
         replyToText: String? = null
     ) {
-        scope.launch {
+        val job = scope.launch {
             val stream = prepareFramedStream(text)
             val totalChunks = (stream.size + RadioPacket.MAX_PAYLOAD_SIZE - 1) / RadioPacket.MAX_PAYLOAD_SIZE
             val msgIdByte = nextMessageId.getAndIncrement() and 0xFF
@@ -473,6 +491,19 @@ class RadioProtocolManager(
             var allSucceeded = true
 
             for (chunkIdx in 0 until totalChunks) {
+                // Strict check: if cancelled or already DELIVERED/SEEN/DELETED, cancel job immediately
+                val dbState = repository.getMessageById(uuid)
+                if (dbState == null ||
+                    dbState.status == MessageStatus.DELIVERED ||
+                    dbState.status == MessageStatus.SEEN ||
+                    dbState.status == MessageStatus.READ ||
+                    dbState.status == MessageStatus.COMPLETED ||
+                    dbState.status == MessageStatus.DELETED ||
+                    dbState.isDeleted) {
+                    activeRetryJobs.remove(uuid)
+                    return@launch
+                }
+
                 val start = chunkIdx * RadioPacket.MAX_PAYLOAD_SIZE
                 val end = minOf(start + RadioPacket.MAX_PAYLOAD_SIZE, stream.size)
                 val chunkPayload = stream.sliceArray(start until end)
@@ -495,6 +526,19 @@ class RadioProtocolManager(
                     var retries = 0
 
                     while (!chunkAcked && retries <= tcpRetryLimit && isActive) {
+                        // Strict check before every re-transmission
+                        val current = repository.getMessageById(uuid)
+                        if (current == null ||
+                            current.status == MessageStatus.DELIVERED ||
+                            current.status == MessageStatus.SEEN ||
+                            current.status == MessageStatus.READ ||
+                            current.status == MessageStatus.COMPLETED ||
+                            current.status == MessageStatus.DELETED ||
+                            current.isDeleted) {
+                            activeRetryJobs.remove(uuid)
+                            return@launch
+                        }
+
                         val deferred = CompletableDeferred<Unit>()
                         pendingAcks[key] = deferred
 
@@ -529,13 +573,28 @@ class RadioProtocolManager(
                 }
             }
 
+            // Check if already updated by an incoming Type 3 or Type 4 ACK
+            val current = repository.getMessageById(uuid)
+            if (current != null && (
+                current.status == MessageStatus.DELIVERED ||
+                current.status == MessageStatus.SEEN ||
+                current.status == MessageStatus.READ ||
+                current.status == MessageStatus.COMPLETED ||
+                current.status == MessageStatus.DELETED ||
+                current.isDeleted)) {
+                activeRetryJobs.remove(uuid)
+                return@launch
+            }
+
             val finalStatus = when {
                 !allSucceeded -> MessageStatus.FAILED
                 headerType == RadioPacket.TYPE_UDP_TEXT -> MessageStatus.SENT_UNACKED
-                else -> MessageStatus.DELIVERED
+                else -> MessageStatus.SENT_UNACKED // Strictly DO NOT fake DELIVERED; wait for remote Type 3 ACK
             }
             repository.updateStatus(uuid, finalStatus)
+            activeRetryJobs.remove(uuid)
         }
+        activeRetryJobs[job.hashCode().toString()] = job
     }
 
     /**

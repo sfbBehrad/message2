@@ -6,7 +6,7 @@ import kotlinx.coroutines.flow.Flow
 @Dao
 interface ChatMessageDao {
 
-    @Query("SELECT * FROM chat_messages WHERE isDeleted = 0 ORDER BY timestamp ASC")
+    @Query("SELECT * FROM chat_messages ORDER BY timestamp ASC")
     fun getAllMessages(): Flow<List<ChatMessageEntity>>
 
     @Query("SELECT * FROM chat_messages WHERE id = :id LIMIT 1")
@@ -18,7 +18,7 @@ interface ChatMessageDao {
     @Query("SELECT * FROM chat_messages WHERE messageIdByte = :byteId AND sender = 'PEER' ORDER BY timestamp DESC LIMIT 1")
     suspend fun getLatestIncomingByByteId(byteId: Int): ChatMessageEntity?
 
-    @Query("SELECT * FROM chat_messages WHERE sender = 'PEER' AND status != 'SEEN'")
+    @Query("SELECT * FROM chat_messages WHERE sender = 'PEER' AND status NOT IN ('SEEN', 'READ', 'DELETED') AND isDeleted = 0")
     suspend fun getUnseenIncomingMessages(): List<ChatMessageEntity>
 
     @Query("SELECT * FROM chat_messages WHERE sender = 'ME' AND isDeleted = 0 AND status IN ('PENDING', 'SENDING', 'SENT_UNACKED') ORDER BY timestamp ASC")
@@ -39,14 +39,17 @@ interface ChatMessageDao {
     @Query("UPDATE chat_messages SET currentChunk = :chunk, retriesCurrentChunk = :retries, status = :status WHERE id = :id")
     suspend fun updateProgress(id: String, chunk: Int, retries: Int, status: String)
 
-    @Query("UPDATE chat_messages SET status = 'SEEN' WHERE sender = 'PEER' AND status != 'SEEN'")
+    @Query("UPDATE chat_messages SET status = 'SEEN' WHERE sender = 'PEER' AND status NOT IN ('SEEN', 'READ', 'DELETED')")
     suspend fun markAllIncomingAsSeen()
 
     @Query("UPDATE chat_messages SET textContent = :newText, isEdited = 1 WHERE id = :id")
     suspend fun updateTextContent(id: String, newText: String)
 
-    @Query("UPDATE chat_messages SET isDeleted = 1, textContent = 'This message was deleted' WHERE id = :id")
+    @Query("UPDATE chat_messages SET status = 'DELETED', isDeleted = 1, textContent = 'This message was deleted.' WHERE id = :id")
     suspend fun markAsDeleted(id: String)
+
+    @Query("UPDATE chat_messages SET status = 'DELETED', isDeleted = 1, textContent = 'This message was deleted.' WHERE messageIdByte = :byteId AND sender = 'PEER'")
+    suspend fun markIncomingAsDeletedByByteId(byteId: Int)
 
     @Query("DELETE FROM chat_messages WHERE id = :id")
     suspend fun deleteMessageById(id: String)
