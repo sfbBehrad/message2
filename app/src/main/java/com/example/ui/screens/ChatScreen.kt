@@ -14,6 +14,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.layout.*
@@ -22,6 +23,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -101,6 +103,9 @@ fun ChatScreen(
 
     // In-App Notification dismiss state for Media Transfer Banner
     var isMediaBannerDismissed by remember { mutableStateOf(false) }
+
+    // Push-to-Talk (Walkie-Talkie) state
+    var isRecordingAudio by remember { mutableStateOf(false) }
 
     // Re-show banner if a new media transfer starts
     LaunchedEffect(activeTransfers.keys) {
@@ -574,7 +579,54 @@ fun ChatScreen(
             }
         }
 
-        // Chat Input Bar with Long-Press Send Menu
+        // PTT Live Audio Recording Indicator Banner
+        AnimatedVisibility(
+            visible = isRecordingAudio,
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut()
+        ) {
+            Surface(
+                color = Color(0xFF261214),
+                border = androidx.compose.foundation.BorderStroke(1.dp, TelegramRed.copy(alpha = 0.6f)),
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Mic,
+                        contentDescription = "Recording",
+                        tint = TelegramRed,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Recording Audio... (Type 12 Live Audio Streaming)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    Text(
+                        text = "RELEASE TO TRANSMIT",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TelegramRed,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+
+        // Chat Input Bar with Long-Press Send Menu and PTT Mic Button
         Surface(
             color = TelegramSurface,
             tonalElevation = 6.dp,
@@ -607,8 +659,8 @@ fun ChatScreen(
                     onValueChange = { textInput = it },
                     placeholder = {
                         Text(
-                            text = "Message...",
-                            color = TextMuted,
+                            text = if (isRecordingAudio) "Recording live voice..." else "Message...",
+                            color = if (isRecordingAudio) TelegramRed else TextMuted,
                             fontSize = 14.sp
                         )
                     },
@@ -620,13 +672,49 @@ fun ChatScreen(
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedTextColor = TextBright,
                         unfocusedTextColor = TextBright,
-                        focusedBorderColor = Color(0xFF283647),
-                        unfocusedBorderColor = BorderSubtle,
+                        focusedBorderColor = if (isRecordingAudio) TelegramRed else Color(0xFF283647),
+                        unfocusedBorderColor = if (isRecordingAudio) TelegramRed else BorderSubtle,
                         focusedContainerColor = TelegramBgDark,
                         unfocusedContainerColor = TelegramBgDark
                     ),
                     maxLines = 4
                 )
+
+                Spacer(modifier = Modifier.width(4.dp))
+
+                // Push-to-Talk (PTT) Walkie-Talkie Microphone Button (Header Type 12)
+                Box(
+                    modifier = Modifier
+                        .size(42.dp)
+                        .clip(CircleShape)
+                        .background(if (isRecordingAudio) TelegramRed else Color(0xFF232E3C))
+                        .border(
+                            width = 1.dp,
+                            color = if (isRecordingAudio) TelegramRed else Color(0xFF334455),
+                            shape = CircleShape
+                        )
+                        .pointerInput(Unit) {
+                            detectTapGestures(
+                                onPress = {
+                                    isRecordingAudio = true
+                                    try {
+                                        tryAwaitRelease()
+                                    } finally {
+                                        isRecordingAudio = false
+                                    }
+                                }
+                            )
+                        }
+                        .testTag("ptt_mic_button"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Mic,
+                        contentDescription = "Push to Talk (Press and Hold)",
+                        tint = if (isRecordingAudio) Color.White else TelegramBlue,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
 
                 Spacer(modifier = Modifier.width(4.dp))
 
@@ -1260,10 +1348,14 @@ fun TelegramMessageBubble(
 
                         if (isMe && !isDeleted) {
                             Spacer(modifier = Modifier.width(4.dp))
-                            // Accurate Delivery Tick System (Requirement 4)
-                            when (message.status) {
-                                // 2 Blue Ticks: Read / Seen (Type 4 ACK received)
-                                MessageStatus.SEEN, MessageStatus.READ -> {
+                            // Strictly bound to Room DB state integer (Requirement 3)
+                            // 0: Clock (Sending)
+                            // 1: 1 Tick (Sent to local ESP Socket)
+                            // 2: 2 Grey Ticks (Received Type 3 ACK from remote)
+                            // 3: 2 Blue Ticks (Received Type 4 ACK from remote)
+                            when (message.stateInt) {
+                                // 3: 2 Blue Ticks (Received Type 4 ACK from remote)
+                                3 -> {
                                     Icon(
                                         imageVector = Icons.Default.DoneAll,
                                         contentDescription = "Read (2 Blue Ticks)",
@@ -1271,35 +1363,35 @@ fun TelegramMessageBubble(
                                         modifier = Modifier.size(15.dp)
                                     )
                                 }
-                                // 2 Black/Grey Ticks: Delivered (Type 3 ACK received)
-                                MessageStatus.DELIVERED, MessageStatus.COMPLETED -> {
+                                // 2: 2 Grey Ticks (Received Type 3 ACK from remote)
+                                2 -> {
                                     Icon(
                                         imageVector = Icons.Default.DoneAll,
-                                        contentDescription = "Delivered (2 Black Ticks)",
-                                        tint = TextBright,
+                                        contentDescription = "Delivered (2 Grey Ticks)",
+                                        tint = TextMuted,
                                         modifier = Modifier.size(15.dp)
                                     )
                                 }
-                                // 1 Black/Grey Tick: Sent to local ESP32
-                                MessageStatus.SENT_UNACKED -> {
+                                // 1: 1 Tick (Sent to local ESP Socket)
+                                1 -> {
                                     Icon(
                                         imageVector = Icons.Default.Check,
-                                        contentDescription = "Sent to ESP32 (1 Black Tick)",
+                                        contentDescription = "Sent to ESP Socket (1 Tick)",
                                         tint = TextMuted,
                                         modifier = Modifier.size(13.dp)
                                     )
                                 }
-                                // Clock: In-flight / Attempting
-                                MessageStatus.SENDING, MessageStatus.PENDING -> {
+                                // 0: Clock (Sending)
+                                0 -> {
                                     Icon(
                                         imageVector = Icons.Default.AccessTime,
-                                        contentDescription = "Attempting (Clock)",
+                                        contentDescription = "Sending (Clock)",
                                         tint = TelegramAmber,
                                         modifier = Modifier.size(13.dp)
                                     )
                                 }
-                                // Failed
-                                MessageStatus.FAILED -> {
+                                // -1: Failed
+                                -1 -> {
                                     Icon(
                                         imageVector = Icons.Default.Warning,
                                         contentDescription = "Failed",
@@ -1307,7 +1399,6 @@ fun TelegramMessageBubble(
                                         modifier = Modifier.size(14.dp)
                                     )
                                 }
-                                MessageStatus.DELETED -> {}
                             }
                         }
                     }

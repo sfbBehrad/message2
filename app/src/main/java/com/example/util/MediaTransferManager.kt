@@ -251,6 +251,20 @@ class MediaTransferManager(private val context: Context) {
         return if (end == bytes.size) bytes else bytes.copyOf(end)
     }
 
+    /**
+     * Cleans trailing padding bytes from JPEG byte streams.
+     * Searches for the standard JPEG End-Of-Image marker (0xFF, 0xD9) and trims any trailing zero bytes.
+     */
+    fun cleanJpeg(bytes: ByteArray): ByteArray {
+        val trimmed = trimTrailingZeros(bytes)
+        for (i in (trimmed.size - 2) downTo 0) {
+            if (trimmed[i] == 0xFF.toByte() && trimmed[i + 1] == 0xD9.toByte()) {
+                return trimmed.copyOf(i + 2)
+            }
+        }
+        return trimmed
+    }
+
     private fun reconstructBytes(totalChunks: Int, chunksMap: Map<Int, ByteArray>): ByteArray? {
         return try {
             val totalBytes = totalChunks * RadioPacket.MAX_PAYLOAD_SIZE
@@ -258,51 +272,76 @@ class MediaTransferManager(private val context: Context) {
             var offset = 0
             for (i in 0 until totalChunks) {
                 val chunk = chunksMap[i] ?: return null
-                System.arraycopy(chunk, 0, combined, offset, RadioPacket.MAX_PAYLOAD_SIZE)
+                System.arraycopy(chunk, 0, combined, offset, minOf(chunk.size, RadioPacket.MAX_PAYLOAD_SIZE))
                 offset += RadioPacket.MAX_PAYLOAD_SIZE
             }
 
-            // CRITICAL FIX: Trim 0x00 padding bytes from the final chunk of the reassembled byte array
-            val trimmedReassembled = trimTrailingZeros(combined)
-            if (trimmedReassembled.isEmpty()) return null
+            val candidates = mutableListOf<ByteArray>()
 
-            val rawPayload = if (trimmedReassembled.size >= 4) {
-                val totalLen = ((trimmedReassembled[0].toInt() and 0xFF) shl 24) or
-                        ((trimmedReassembled[1].toInt() and 0xFF) shl 16) or
-                        ((trimmedReassembled[2].toInt() and 0xFF) shl 8) or
-                        (trimmedReassembled[3].toInt() and 0xFF)
+            // 1. Check exact 4-byte big-endian framing length header
+            if (combined.size >= 4) {
+                val totalLen = ((combined[0].toInt() and 0xFF) shl 24) or
+                        ((combined[1].toInt() and 0xFF) shl 16) or
+                        ((combined[2].toInt() and 0xFF) shl 8) or
+                        (combined[3].toInt() and 0xFF)
 
-                if (totalLen in 1..(trimmedReassembled.size - 4)) {
-                    trimmedReassembled.sliceArray(4 until (4 + totalLen))
-                } else {
-                    trimmedReassembled
-                }
-            } else {
-                trimmedReassembled
-            }
-
-            // Attempt AES decrypt
-            val decryptedRaw = AesSecurity.decrypt(rawPayload)
-                ?: AesSecurity.decrypt(trimmedReassembled)
-                ?: rawPayload
-
-            // CRITICAL FIX: Trim trailing zeros from reassembled/decrypted byte array BEFORE decompressing it
-            val toDecompress = trimTrailingZeros(decryptedRaw)
-
-            try {
-                MediaCompressor.gzipDecompress(toDecompress)
-            } catch (e: Exception) {
-                // If already raw JPEG (magic header 0xFF 0xD8), return directly
-                if (toDecompress.size >= 2 && toDecompress[0] == 0xFF.toByte() && toDecompress[1] == 0xD8.toByte()) {
-                    toDecompress
-                } else {
-                    try {
-                        MediaCompressor.gzipDecompress(trimTrailingZeros(rawPayload))
-                    } catch (_: Exception) {
-                        toDecompress
+                if (totalLen in 1..(combined.size - 4)) {
+                    val exactEncrypted = combined.sliceArray(4 until (4 + totalLen))
+                    val decrypted = AesSecurity.decrypt(exactEncrypted)
+                    if (decrypted != null) {
+                        val decompressed = try {
+                            MediaCompressor.gzipDecompress(trimTrailingZeros(decrypted))
+                        } catch (_: Exception) {
+                            decrypted
+                        }
+                        candidates.add(decompressed)
                     }
                 }
             }
+
+            // 2. Fallback: Trim trailing 0x00 padding bytes from reconstructed byte array
+            val trimmedReassembled = trimTrailingZeros(combined)
+            if (trimmedReassembled.isNotEmpty()) {
+                val rawPayload = if (trimmedReassembled.size >= 4) {
+                    val totalLen = ((trimmedReassembled[0].toInt() and 0xFF) shl 24) or
+                            ((trimmedReassembled[1].toInt() and 0xFF) shl 16) or
+                            ((trimmedReassembled[2].toInt() and 0xFF) shl 8) or
+                            (trimmedReassembled[3].toInt() and 0xFF)
+
+                    if (totalLen in 1..(trimmedReassembled.size - 4)) {
+                        trimmedReassembled.sliceArray(4 until (4 + totalLen))
+                    } else {
+                        trimmedReassembled
+                    }
+                } else {
+                    trimmedReassembled
+                }
+
+                val decryptedRaw = AesSecurity.decrypt(rawPayload)
+                    ?: AesSecurity.decrypt(trimmedReassembled)
+                    ?: rawPayload
+
+                val toDecompress = trimTrailingZeros(decryptedRaw)
+                try {
+                    candidates.add(MediaCompressor.gzipDecompress(toDecompress))
+                } catch (_: Exception) {
+                    candidates.add(toDecompress)
+                }
+            }
+
+            // 3. Find the best valid decoded JPEG candidate
+            for (candidate in candidates) {
+                val cleaned = cleanJpeg(candidate)
+                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(cleaned, 0, cleaned.size, opts)
+                if (opts.outWidth > 0 && opts.outHeight > 0) {
+                    return cleaned
+                }
+            }
+
+            // Fallback to first non-empty cleaned candidate or trimmed array
+            candidates.firstOrNull { it.isNotEmpty() }?.let { return cleanJpeg(it) }
+            cleanJpeg(trimmedReassembled)
         } catch (e: Exception) {
             e.printStackTrace()
             null
@@ -328,7 +367,8 @@ class MediaTransferManager(private val context: Context) {
             isFailed = isFailed
         )
         val currentMap = _activeTransfers.value.toMutableMap()
-        if (isComplete || isFailed) {
+        // Ensure that completed, failed, or 100% finished transfers are removed immediately
+        if (isComplete || isFailed || current >= totalChunks) {
             currentMap.remove(messageId)
         } else {
             currentMap[messageId] = progress

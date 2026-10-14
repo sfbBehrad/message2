@@ -46,10 +46,14 @@ data class RadioPacket(
         const val TYPE_HEARTBEAT_PING = 9  // E2E Ping
         const val TYPE_HEARTBEAT_PONG = 10 // E2E Pong
         const val TYPE_NACK = 11           // Selective Repeat NACK
+        const val TYPE_LIVE_AUDIO = 12     // PTT Live Audio Chunk (Walkie-Talkie)
 
         fun toBytes(packet: RadioPacket): ByteArray = PacketParser.serialize(packet)
 
         fun fromBytes(bytes: ByteArray): RadioPacket? = PacketParser.parse(bytes)
+
+        fun buildAudioChunk(messageId: Int, chunkIndex: Int, totalChunks: Int, audioBytes: ByteArray): RadioPacket =
+            PacketParser.buildAudioChunk(messageId, chunkIndex, totalChunks, audioBytes)
 
         fun buildAckDelivered(targetPacket: RadioPacket): RadioPacket =
             PacketParser.buildAckDelivered(targetPacket)

@@ -241,6 +241,14 @@ class RadioChatViewModel(application: Application) : AndroidViewModel(applicatio
         BluetoothForegroundService.instance?.disconnectSocket() ?: bluetoothService.disconnect()
     }
 
+    fun disconnectAndForgetNode() {
+        viewModelScope.launch {
+            settingsDataStore.updateTargetNode("")
+            settingsDataStore.updateTargetAddress("")
+            BluetoothForegroundService.instance?.disconnectAndForgetNode() ?: bluetoothService.disconnect()
+        }
+    }
+
     fun refreshDevices() {
         BluetoothForegroundService.instance?.refreshPairedDevices() ?: bluetoothService.refreshPairedDevices()
     }

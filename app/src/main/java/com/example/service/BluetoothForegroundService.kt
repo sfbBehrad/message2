@@ -58,6 +58,7 @@ class BluetoothForegroundService : Service() {
     private var readJob: Job? = null
     private var heartbeatJob: Job? = null
     private var retryLoopJob: Job? = null
+    private var autoReconnectJob: Job? = null
 
     private lateinit var database: AppDatabase
     private lateinit var repository: ChatRepository
@@ -75,6 +76,7 @@ class BluetoothForegroundService : Service() {
         const val ACTION_STOP = "com.example.service.STOP_BRIDGE"
         const val ACTION_CONNECT = "com.example.service.CONNECT"
         const val ACTION_PING_NOW = "com.example.service.PING_NOW"
+        const val ACTION_FORGET_NODE = "com.example.service.FORGET_NODE"
         const val EXTRA_ADDRESS = "extra_address"
         const val EXTRA_NAME = "extra_name"
 
@@ -190,6 +192,7 @@ class BluetoothForegroundService : Service() {
 
         startHeartbeatLoop()
         startInfiniteRetryLoop()
+        startAggressiveAutoReconnectLoop()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -207,6 +210,9 @@ class BluetoothForegroundService : Service() {
             }
             ACTION_PING_NOW -> {
                 sendImmediatePing()
+            }
+            ACTION_FORGET_NODE -> {
+                disconnectAndForgetNode()
             }
         }
 
@@ -233,6 +239,7 @@ class BluetoothForegroundService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         instance = null
+        autoReconnectJob?.cancel()
         heartbeatJob?.cancel()
         retryLoopJob?.cancel()
         readJob?.cancel()
@@ -324,6 +331,14 @@ class BluetoothForegroundService : Service() {
 
                 _connectionStatus.value = ConnectionStatus.CONNECTED
                 _connectedDeviceName.value = device.name ?: deviceAddress
+
+                // Sticky Node: Save to SettingsDataStore for aggressive background reconnection
+                serviceScope.launch {
+                    settingsDataStore.updateTargetAddress(deviceAddress)
+                    if (!deviceName.isNullOrBlank()) {
+                        settingsDataStore.updateTargetNode(deviceName)
+                    }
+                }
 
                 updateTopology {
                     copy(
@@ -606,6 +621,79 @@ class BluetoothForegroundService : Service() {
                 }
             }
         }
+    }
+
+    // -------------------------------------------------------------
+    // Aggressive Auto-Reconnect Loop (Requirement 2: Sticky Node)
+    // -------------------------------------------------------------
+
+    @SuppressLint("MissingPermission")
+    private fun startAggressiveAutoReconnectLoop() {
+        autoReconnectJob?.cancel()
+        autoReconnectJob = serviceScope.launch {
+            while (isActive) {
+                try {
+                    val settings = settingsDataStore.settingsFlow.first()
+                    val targetNode = settings.targetNode
+                    val targetAddress = settings.targetAddress
+
+                    // Run aggressive reconnect loop if sticky node is set and using hardware Bluetooth
+                    if (targetNode.isNotBlank() && settings.transportMode == "HARDWARE_BLUETOOTH") {
+                        if (_connectionStatus.value != ConnectionStatus.CONNECTED &&
+                            _connectionStatus.value != ConnectionStatus.CONNECTING) {
+
+                            val adapter = bluetoothAdapter
+                            if (adapter != null && adapter.isEnabled) {
+                                // Match by saved device address first, or bonded device name
+                                val targetDevice = if (targetAddress.isNotBlank()) {
+                                    try {
+                                        adapter.getRemoteDevice(targetAddress)
+                                    } catch (_: Exception) {
+                                        null
+                                    }
+                                } else {
+                                    adapter.bondedDevices?.firstOrNull {
+                                        it.name?.equals(targetNode, ignoreCase = true) == true ||
+                                                it.address.equals(targetNode, ignoreCase = true)
+                                    }
+                                }
+
+                                if (targetDevice != null) {
+                                    connectToBluetoothDevice(targetDevice.address, targetDevice.name ?: targetNode)
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+
+                // If socket disconnects, wait 3 seconds and attempt to reconnect silently FOREVER
+                delay(3000L)
+            }
+        }
+    }
+
+    /**
+     * Breaks the Aggressive Auto-Reconnect loop and clears the sticky node in SettingsDataStore.
+     */
+    fun disconnectAndForgetNode() {
+        serviceScope.launch {
+            settingsDataStore.updateTargetNode("")
+            settingsDataStore.updateTargetAddress("")
+        }
+        disconnectSocket()
+        _connectionStatus.value = ConnectionStatus.DISCONNECTED
+        _connectedDeviceName.value = null
+        updateTopology {
+            copy(
+                localLinkActive = false,
+                radioLinkActive = false,
+                remoteLinkActive = false,
+                localNodeName = "Offline"
+            )
+        }
+        updateNotification()
     }
 
     // -------------------------------------------------------------

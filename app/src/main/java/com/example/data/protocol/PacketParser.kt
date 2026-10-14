@@ -18,6 +18,7 @@ import com.example.data.model.RadioPacket
  *   9: Heartbeat Ping (E2E Link Monitoring)
  *  10: Heartbeat Pong (E2E Link Confirmation)
  *  11: NACK (Selective Repeat Missing Chunks Request)
+ *  12: Live Audio Chunk (Push-to-Talk / Walkie-Talkie)
  *
  * Byte 1: Message ID (0 - 255)
  * Bytes 2-3: Current Chunk Index / Ping Seq / Missing Count (uint16 big-endian)
@@ -41,6 +42,7 @@ object PacketParser {
     const val TYPE_HEARTBEAT_PING = 9
     const val TYPE_HEARTBEAT_PONG = 10
     const val TYPE_NACK = 11
+    const val TYPE_LIVE_AUDIO = 12
 
     /**
      * Parses a raw 32-byte array into a RadioPacket.
@@ -177,6 +179,22 @@ object PacketParser {
     }
 
     /**
+     * Builds a Type 12 (Live Audio Chunk) packet for PTT Walkie-Talkie streaming.
+     */
+     fun buildAudioChunk(messageId: Int, chunkIndex: Int, totalChunks: Int, audioBytes: ByteArray): RadioPacket {
+        val payload = ByteArray(MAX_PAYLOAD_SIZE)
+        val copyLen = minOf(audioBytes.size, MAX_PAYLOAD_SIZE)
+        System.arraycopy(audioBytes, 0, payload, 0, copyLen)
+        return RadioPacket(
+            type = TYPE_LIVE_AUDIO,
+            messageId = messageId,
+            chunkIndex = chunkIndex,
+            totalChunks = maxOf(1, totalChunks),
+            payload = payload
+        )
+    }
+
+    /**
      * Returns true if this packet requires TCP ACK looping.
      */
     fun requiresAck(type: Int): Boolean {
@@ -199,6 +217,7 @@ object PacketParser {
         TYPE_HEARTBEAT_PING -> "PING (Heartbeat)"
         TYPE_HEARTBEAT_PONG -> "PONG (Heartbeat)"
         TYPE_NACK -> "NACK (Selective Repeat)"
+        TYPE_LIVE_AUDIO -> "LIVE_AUDIO (PTT)"
         else -> "UNKNOWN($type)"
     }
 }

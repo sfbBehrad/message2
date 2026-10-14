@@ -39,6 +39,23 @@ data class ChatMessage(
     val isEdited: Boolean = false,
     val isDeleted: Boolean = false
 ) {
+    /**
+     * Strictly binds message delivery state to integer:
+     * 0: Clock (Sending)
+     * 1: 1 Tick (Sent to local ESP Socket)
+     * 2: 2 Grey Ticks (Received Type 3 ACK from remote)
+     * 3: 2 Blue Ticks (Received Type 4 ACK from remote)
+     */
+    val stateInt: Int
+        get() = when (status) {
+            MessageStatus.PENDING, MessageStatus.SENDING -> 0
+            MessageStatus.SENT_UNACKED -> 1
+            MessageStatus.DELIVERED -> 2
+            MessageStatus.SEEN, MessageStatus.READ, MessageStatus.COMPLETED -> 3
+            MessageStatus.FAILED -> -1
+            MessageStatus.DELETED -> -2
+        }
+
     fun toEntity(): ChatMessageEntity = ChatMessageEntity(
         id = id,
         messageIdByte = messageIdByte,

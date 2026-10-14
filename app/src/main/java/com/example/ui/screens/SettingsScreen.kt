@@ -320,14 +320,18 @@ fun SettingsScreen(
                         }
                     }
 
-                    if (connectionStatus == ConnectionStatus.CONNECTED) {
-                        Spacer(modifier = Modifier.height(8.dp))
+                    if (connectionStatus == ConnectionStatus.CONNECTED || appSettings.targetNode.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(10.dp))
                         Button(
-                            onClick = { viewModel.disconnect() },
+                            onClick = { viewModel.disconnectAndForgetNode() },
                             colors = ButtonDefaults.buttonColors(containerColor = TelegramRed),
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("disconnect_forget_node_btn")
                         ) {
-                            Text("Disconnect ($connectedDeviceName)")
+                            Icon(Icons.Default.LinkOff, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Disconnect & Forget Node")
                         }
                     }
                 }

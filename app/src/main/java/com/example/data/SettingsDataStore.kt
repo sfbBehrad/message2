@@ -14,6 +14,7 @@ val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "ra
 data class AppSettings(
     val passphrase: String = "NRF24_SECURE_KEY_2026_TACTICAL",
     val targetNode: String = "ESP_Node_1",
+    val targetAddress: String = "",
     val tcpRetryLimit: Int = 10, // 10, 100, or Int.MAX_VALUE for infinite
     val pingIntervalSec: Int = 5,
     val resendIntervalMs: Long = 1000L,
@@ -27,6 +28,7 @@ class SettingsDataStore(private val context: Context) {
     companion object {
         val KEY_PASSPHRASE = stringPreferencesKey("key_passphrase")
         val KEY_TARGET_NODE = stringPreferencesKey("key_target_node")
+        val KEY_TARGET_ADDRESS = stringPreferencesKey("key_target_address")
         val KEY_TCP_RETRY_LIMIT = intPreferencesKey("key_tcp_retry_limit")
         val KEY_PING_INTERVAL_SEC = intPreferencesKey("key_ping_interval_sec")
         val KEY_RESEND_INTERVAL_MS = longPreferencesKey("key_resend_interval_ms")
@@ -56,6 +58,7 @@ class SettingsDataStore(private val context: Context) {
             AppSettings(
                 passphrase = preferences[KEY_PASSPHRASE] ?: "NRF24_SECURE_KEY_2026_TACTICAL",
                 targetNode = preferences[KEY_TARGET_NODE] ?: "ESP_Node_1",
+                targetAddress = preferences[KEY_TARGET_ADDRESS] ?: "",
                 tcpRetryLimit = preferences[KEY_TCP_RETRY_LIMIT] ?: 10,
                 pingIntervalSec = preferences[KEY_PING_INTERVAL_SEC] ?: 5,
                 resendIntervalMs = preferences[KEY_RESEND_INTERVAL_MS] ?: 1000L,
@@ -74,6 +77,12 @@ class SettingsDataStore(private val context: Context) {
     suspend fun updateTargetNode(nodeName: String) {
         context.dataStore.edit { preferences ->
             preferences[KEY_TARGET_NODE] = nodeName
+        }
+    }
+
+    suspend fun updateTargetAddress(address: String) {
+        context.dataStore.edit { preferences ->
+            preferences[KEY_TARGET_ADDRESS] = address
         }
     }
 
